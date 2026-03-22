@@ -11,7 +11,9 @@ import yaml
 
 from .agent import AgentState, MotionCommand, initialize_agent_state, step_agent
 from .slam import (
+    EkfAssociationSummary,
     EkfDebugInfo,
+    EkfStepDiagnostics,
     LidarScan,
     EkfUpdateResult,
     PersistentLandmark,
@@ -19,6 +21,7 @@ from .slam import (
     TruthObservationSet,
     VoxelCellState,
     WallSegment,
+    build_ekf_step_diagnostics,
     compute_ekf_debug_info,
     ekf_predict,
     ekf_update_pose_only_batch,
@@ -320,10 +323,12 @@ class StepResult:
     lidar_scan: LidarScan
     observed_landmarks: list[ScanMeasurement]
     truth_observation_set: TruthObservationSet | None
+    association_result: EkfAssociationSummary | None
     motion_command: MotionCommand
     measured_distance: float
     measured_turn: float
     pose_update_results: list[EkfUpdateResult]
+    ekf_diagnostics: EkfStepDiagnostics
     ekf_debug_info: EkfDebugInfo
 
 
@@ -337,6 +342,7 @@ class SimulationState:
     slam_state: SlamState
     step_index: int = 0
     is_paused: bool = False
+    last_step_result: StepResult | None = None
     artists: PlotArtists | None = None
     animation: object | None = None
 
@@ -801,7 +807,28 @@ def step_simulation(state: SimulationState):
         measured_turn,
         state.config.odometry_noise,
     )
+    pre_update_mu = slam_state.mu.copy()
+    pre_update_sigma = slam_state.Sigma.copy()
     pose_update_results = apply_pose_only_ekf_correction(state, truth_observation_set)
+    num_candidate_observations = len(truth_observation_set.observations) if truth_observation_set is not None else 0
+    association_result = None
+    if truth_observation_set is not None and state.config.ekf.pose_update.use_truth_observations:
+        association_result = EkfAssociationSummary(
+            num_candidate_observations=num_candidate_observations,
+            num_matches=len(pose_update_results),
+            num_rejections=0,
+            source="truth_harness",
+            gating_applied=False,
+        )
+    ekf_diagnostics = build_ekf_step_diagnostics(
+        pose_before_update=pre_update_mu,
+        pose_after_update=slam_state.mu,
+        sigma_before_update=pre_update_sigma,
+        sigma_after_update=slam_state.Sigma,
+        update_results=pose_update_results,
+        num_candidate_observations=num_candidate_observations,
+        num_rejections=0,
+    )
     ekf_debug_info = compute_ekf_debug_info(slam_state.Sigma)
 
     slam_state.true_trajectory_x.append(state.agent_state.true_pose[0])
@@ -810,15 +837,19 @@ def step_simulation(state: SimulationState):
     slam_state.ekf_trajectory_y.append(slam_state.mu[1])
     state.step_index = current_frame
 
-    return StepResult(
+    result = StepResult(
         frame_index=current_frame,
         observation_pose=observation_pose,
         lidar_scan=lidar_scan,
         observed_landmarks=observed_landmarks,
         truth_observation_set=truth_observation_set,
+        association_result=association_result,
         motion_command=command,
         measured_distance=measured_distance,
         measured_turn=measured_turn,
         pose_update_results=pose_update_results,
+        ekf_diagnostics=ekf_diagnostics,
         ekf_debug_info=ekf_debug_info,
     )
+    state.last_step_result = result
+    return result

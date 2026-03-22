@@ -23,6 +23,7 @@ class PlotArtists:
     ekf_marker: object
     true_heading: object
     ekf_heading: object
+    ekf_text: object
     status_text: object
 
 
@@ -76,6 +77,25 @@ def _build_status_text(state: SimulationState):
     )
 
 
+def _build_ekf_diagnostics_text(state: SimulationState):
+    if state.last_step_result is None:
+        return "EKF: waiting for first step"
+
+    diagnostics = state.last_step_result.ekf_diagnostics
+    debug_info = state.last_step_result.ekf_debug_info
+    return (
+        f"EKF diag | cand={diagnostics.num_candidate_observations}"
+        f" match={diagnostics.num_matches}"
+        f" rej={diagnostics.num_rejections}"
+        f" | trSigma={diagnostics.trace_sigma_before:.4f}->{diagnostics.trace_sigma_after:.4f}"
+        f" | dpose={diagnostics.pose_update_norm:.4f}"
+        f" | NIS(mean/max)={diagnostics.mean_nis:.3f}/{diagnostics.max_nis:.3f}"
+        f"\nEKF std | x={debug_info.pose_std_x:.3f}"
+        f" y={debug_info.pose_std_y:.3f}"
+        f" theta={np.degrees(debug_info.pose_std_theta):.2f} deg"
+    )
+
+
 def create_plot(state: SimulationState):
     _, plt = import_matplotlib_modules()
     fig, ax = plt.subplots(figsize=state.config.plot.figsize)
@@ -99,6 +119,17 @@ def create_plot(state: SimulationState):
     ekf_marker, = ax.plot([], [], "mx", markersize=8, label="EKF Pose")
     true_heading, = ax.plot([], [], "r-", linewidth=2)
     ekf_heading, = ax.plot([], [], "m-", linewidth=2)
+    ekf_text = ax.text(
+        0.02,
+        0.98,
+        _build_ekf_diagnostics_text(state),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        family="monospace",
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.6"},
+    )
 
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=4, frameon=False)
     status_text = fig.text(0.5, 0.04, _build_status_text(state), ha="center", va="center")
@@ -116,6 +147,7 @@ def create_plot(state: SimulationState):
         ekf_marker=ekf_marker,
         true_heading=true_heading,
         ekf_heading=ekf_heading,
+        ekf_text=ekf_text,
         status_text=status_text,
     )
 
@@ -167,6 +199,7 @@ def render_simulation(state: SimulationState):
         [slam_state.mu[0], slam_state.mu[0] + heading_length * np.cos(slam_state.mu[2])],
         [slam_state.mu[1], slam_state.mu[1] + heading_length * np.sin(slam_state.mu[2])],
     )
+    artists.ekf_text.set_text(_build_ekf_diagnostics_text(state))
     pause_suffix = " [Paused]" if state.is_paused else ""
     artists.status_text.set_text(_build_status_text(state) + pause_suffix)
 
@@ -180,6 +213,7 @@ def render_simulation(state: SimulationState):
         artists.ekf_marker,
         artists.true_heading,
         artists.ekf_heading,
+        artists.ekf_text,
         artists.status_text,
     )
 

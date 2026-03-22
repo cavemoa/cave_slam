@@ -65,6 +65,35 @@ class EkfUpdateResult:
     nis: float
 
 
+@dataclass(frozen=True)
+class InnovationStats:
+    innovation_norm: float
+    nis: float
+    accepted: bool
+
+
+@dataclass(frozen=True)
+class EkfAssociationSummary:
+    num_candidate_observations: int
+    num_matches: int
+    num_rejections: int
+    source: str
+    gating_applied: bool
+
+
+@dataclass(frozen=True)
+class EkfStepDiagnostics:
+    num_candidate_observations: int
+    num_matches: int
+    num_rejections: int
+    trace_sigma_before: float
+    trace_sigma_after: float
+    pose_update_norm: float
+    innovation_stats: tuple[InnovationStats, ...]
+    mean_nis: float
+    max_nis: float
+
+
 @dataclass
 class VoxelCellState:
     sum_w: float = 0.0
@@ -111,6 +140,49 @@ def compute_ekf_debug_info(Sigma: np.ndarray):
         pose_std_x=float(np.sqrt(diagonal[0])),
         pose_std_y=float(np.sqrt(diagonal[1])),
         pose_std_theta=float(np.sqrt(diagonal[2])),
+    )
+
+
+def compute_pose_delta_norm(previous_mu: np.ndarray, updated_mu: np.ndarray):
+    delta = np.asarray(updated_mu, dtype=float)[:3] - np.asarray(previous_mu, dtype=float)[:3]
+    delta[2] = normalize_angle(float(delta[2]))
+    return float(np.linalg.norm(delta))
+
+
+def build_innovation_stats(update_results: Sequence[EkfUpdateResult]):
+    return tuple(
+        InnovationStats(
+            innovation_norm=float(np.linalg.norm(result.innovation)),
+            nis=float(result.nis),
+            accepted=True,
+        )
+        for result in update_results
+    )
+
+
+def build_ekf_step_diagnostics(
+    pose_before_update: np.ndarray,
+    pose_after_update: np.ndarray,
+    sigma_before_update: np.ndarray,
+    sigma_after_update: np.ndarray,
+    update_results: Sequence[EkfUpdateResult],
+    num_candidate_observations: int,
+    num_rejections: int = 0,
+):
+    innovation_stats = build_innovation_stats(update_results)
+    nis_values = [stats.nis for stats in innovation_stats]
+    num_matches = len(update_results)
+
+    return EkfStepDiagnostics(
+        num_candidate_observations=num_candidate_observations,
+        num_matches=num_matches,
+        num_rejections=num_rejections,
+        trace_sigma_before=float(np.trace(symmetrize_covariance(np.asarray(sigma_before_update, dtype=float)[:3, :3]))),
+        trace_sigma_after=float(np.trace(symmetrize_covariance(np.asarray(sigma_after_update, dtype=float)[:3, :3]))),
+        pose_update_norm=compute_pose_delta_norm(pose_before_update, pose_after_update),
+        innovation_stats=innovation_stats,
+        mean_nis=float(np.mean(nis_values)) if nis_values else 0.0,
+        max_nis=float(np.max(nis_values)) if nis_values else 0.0,
     )
 
 
