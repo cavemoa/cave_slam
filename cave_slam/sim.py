@@ -13,6 +13,7 @@ from .agent import AgentState, MotionCommand, initialize_agent_state, step_agent
 from .slam import (
     EkfDebugInfo,
     LidarScan,
+    EkfUpdateResult,
     PersistentLandmark,
     ScanMeasurement,
     TruthObservationSet,
@@ -20,6 +21,7 @@ from .slam import (
     WallSegment,
     compute_ekf_debug_info,
     ekf_predict,
+    ekf_update_pose_only_batch,
     extract_landmarks,
     extract_truth_landmark_positions,
     measurements_to_world_points,
@@ -129,6 +131,11 @@ DEFAULT_CONFIG = {
             "enabled": False,
             "max_observations": 8,
             "max_range": 12.0,
+        },
+        "pose_update": {
+            "enabled": False,
+            "use_truth_observations": True,
+            "max_updates_per_frame": 8,
         },
     },
 }
@@ -263,9 +270,17 @@ class TruthUpdateConfig:
 
 
 @dataclass(frozen=True)
+class PoseUpdateConfig:
+    enabled: bool
+    use_truth_observations: bool
+    max_updates_per_frame: int
+
+
+@dataclass(frozen=True)
 class EkfConfig:
     measurement: MeasurementModelConfig
     truth_update: TruthUpdateConfig
+    pose_update: PoseUpdateConfig
 
 
 @dataclass(frozen=True)
@@ -308,6 +323,7 @@ class StepResult:
     motion_command: MotionCommand
     measured_distance: float
     measured_turn: float
+    pose_update_results: list[EkfUpdateResult]
     ekf_debug_info: EkfDebugInfo
 
 
@@ -422,6 +438,7 @@ def parse_config(raw_config: Mapping[str, Any]):
     ekf = _require_mapping(raw["ekf"], "ekf")
     ekf_measurement = _require_mapping(ekf["measurement"], "ekf.measurement")
     ekf_truth_update = _require_mapping(ekf["truth_update"], "ekf.truth_update")
+    ekf_pose_update = _require_mapping(ekf["pose_update"], "ekf.pose_update")
 
     walls_raw = environment.get("walls", [])
     if not isinstance(walls_raw, Sequence) or isinstance(walls_raw, (str, bytes)):
@@ -522,6 +539,11 @@ def parse_config(raw_config: Mapping[str, Any]):
                 enabled=_require_bool(ekf_truth_update["enabled"], "ekf.truth_update.enabled"),
                 max_observations=_require_int(ekf_truth_update["max_observations"], "ekf.truth_update.max_observations"),
                 max_range=_require_float(ekf_truth_update["max_range"], "ekf.truth_update.max_range"),
+            ),
+            pose_update=PoseUpdateConfig(
+                enabled=_require_bool(ekf_pose_update["enabled"], "ekf.pose_update.enabled"),
+                use_truth_observations=_require_bool(ekf_pose_update["use_truth_observations"], "ekf.pose_update.use_truth_observations"),
+                max_updates_per_frame=_require_int(ekf_pose_update["max_updates_per_frame"], "ekf.pose_update.max_updates_per_frame"),
             ),
         ),
     )
@@ -690,6 +712,32 @@ def build_truth_observations(state: SimulationState, observation_pose: np.ndarra
     )
 
 
+def apply_pose_only_ekf_correction(state: SimulationState, truth_observation_set: TruthObservationSet | None):
+    pose_update_config = state.config.ekf.pose_update
+    if not pose_update_config.enabled or not pose_update_config.use_truth_observations or truth_observation_set is None:
+        return []
+
+    max_updates = max(0, pose_update_config.max_updates_per_frame)
+    if max_updates == 0:
+        return []
+
+    selected_observations = truth_observation_set.observations[:max_updates]
+    selected_landmarks = truth_observation_set.landmark_positions[:max_updates]
+    if not selected_observations:
+        return []
+
+    updated_mu, updated_Sigma, update_results = ekf_update_pose_only_batch(
+        state.slam_state.mu,
+        state.slam_state.Sigma,
+        selected_observations,
+        selected_landmarks,
+        state.config.ekf.measurement,
+    )
+    state.slam_state.mu = updated_mu
+    state.slam_state.Sigma = updated_Sigma
+    return update_results
+
+
 def step_simulation(state: SimulationState):
     current_frame = state.step_index + 1
     observation_pose = state.agent_state.true_pose.copy()
@@ -753,6 +801,7 @@ def step_simulation(state: SimulationState):
         measured_turn,
         state.config.odometry_noise,
     )
+    pose_update_results = apply_pose_only_ekf_correction(state, truth_observation_set)
     ekf_debug_info = compute_ekf_debug_info(slam_state.Sigma)
 
     slam_state.true_trajectory_x.append(state.agent_state.true_pose[0])
@@ -770,5 +819,6 @@ def step_simulation(state: SimulationState):
         motion_command=command,
         measured_distance=measured_distance,
         measured_turn=measured_turn,
+        pose_update_results=pose_update_results,
         ekf_debug_info=ekf_debug_info,
     )

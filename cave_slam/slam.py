@@ -56,6 +56,15 @@ class TruthObservationSet:
     landmark_positions: list[np.ndarray]
 
 
+@dataclass(frozen=True)
+class EkfUpdateResult:
+    mu: np.ndarray
+    Sigma: np.ndarray
+    innovation: np.ndarray
+    kalman_gain: np.ndarray
+    nis: float
+
+
 @dataclass
 class VoxelCellState:
     sum_w: float = 0.0
@@ -147,6 +156,79 @@ def innovation_range_bearing(z: np.ndarray, z_hat: np.ndarray):
     innovation = np.asarray(z, dtype=float) - np.asarray(z_hat, dtype=float)
     innovation[1] = normalize_angle(float(innovation[1]))
     return innovation
+
+
+def observation_to_measurement_vector(observation: LandmarkObservation):
+    return np.array([observation.range, observation.bearing], dtype=float)
+
+
+def joseph_covariance_update(Sigma: np.ndarray, K: np.ndarray, H: np.ndarray, R: np.ndarray):
+    identity = np.eye(Sigma.shape[0], dtype=float)
+    updated = (identity - K @ H) @ Sigma @ (identity - K @ H).T + K @ R @ K.T
+    updated = symmetrize_covariance(updated)
+    return ensure_positive_semidefinite(updated)
+
+
+def ekf_update_pose_only(
+    mu: np.ndarray,
+    Sigma: np.ndarray,
+    observation: LandmarkObservation,
+    landmark_position: np.ndarray,
+    measurement_config: MeasurementModelConfig,
+):
+    z = observation_to_measurement_vector(observation)
+    z_hat = predict_range_bearing(mu, landmark_position)
+    H = range_bearing_jacobian_pose(mu, landmark_position)
+    R = measurement_noise_matrix(measurement_config)
+
+    innovation = innovation_range_bearing(z, z_hat)
+    S = H @ Sigma @ H.T + R
+    S = symmetrize_covariance(S)
+    S_inv = np.linalg.inv(S)
+    K = Sigma @ H.T @ S_inv
+
+    updated_mu = np.array(mu, dtype=float, copy=True)
+    updated_mu = updated_mu + K @ innovation
+    updated_mu = normalize_state_angle(updated_mu)
+
+    updated_Sigma = joseph_covariance_update(Sigma, K, H, R)
+    nis = float(innovation.T @ S_inv @ innovation)
+    return EkfUpdateResult(
+        mu=updated_mu,
+        Sigma=updated_Sigma,
+        innovation=innovation,
+        kalman_gain=K,
+        nis=nis,
+    )
+
+
+def ekf_update_pose_only_batch(
+    mu: np.ndarray,
+    Sigma: np.ndarray,
+    observations: Sequence[LandmarkObservation],
+    landmark_positions: Sequence[np.ndarray],
+    measurement_config: MeasurementModelConfig,
+):
+    if len(observations) != len(landmark_positions):
+        raise ValueError("Observations and landmark_positions must have the same length.")
+
+    updated_mu = np.array(mu, dtype=float, copy=True)
+    updated_Sigma = np.array(Sigma, dtype=float, copy=True)
+    update_results: list[EkfUpdateResult] = []
+
+    for observation, landmark_position in zip(observations, landmark_positions):
+        update_result = ekf_update_pose_only(
+            updated_mu,
+            updated_Sigma,
+            observation,
+            landmark_position,
+            measurement_config,
+        )
+        updated_mu = update_result.mu
+        updated_Sigma = update_result.Sigma
+        update_results.append(update_result)
+
+    return updated_mu, updated_Sigma, update_results
 
 
 def extract_truth_landmark_positions(walls: Sequence[WallSegment], merge_tolerance: float = 1e-6):
