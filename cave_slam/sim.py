@@ -15,13 +15,16 @@ from .slam import (
     LidarScan,
     PersistentLandmark,
     ScanMeasurement,
+    TruthObservationSet,
     VoxelCellState,
     WallSegment,
     compute_ekf_debug_info,
     ekf_predict,
     extract_landmarks,
+    extract_truth_landmark_positions,
     measurements_to_world_points,
     simulate_lidar,
+    simulate_landmark_observations_from_truth,
     transform_measurements,
     update_persistent_landmarks,
     update_voxel_grid,
@@ -121,6 +124,11 @@ DEFAULT_CONFIG = {
             "model_type": "range_bearing",
             "range_std": 0.05,
             "bearing_std_deg": 2.0,
+        },
+        "truth_update": {
+            "enabled": False,
+            "max_observations": 8,
+            "max_range": 12.0,
         },
     },
 }
@@ -248,8 +256,16 @@ class MeasurementModelConfig:
 
 
 @dataclass(frozen=True)
+class TruthUpdateConfig:
+    enabled: bool
+    max_observations: int
+    max_range: float
+
+
+@dataclass(frozen=True)
 class EkfConfig:
     measurement: MeasurementModelConfig
+    truth_update: TruthUpdateConfig
 
 
 @dataclass(frozen=True)
@@ -288,6 +304,7 @@ class StepResult:
     observation_pose: np.ndarray
     lidar_scan: LidarScan
     observed_landmarks: list[ScanMeasurement]
+    truth_observation_set: TruthObservationSet | None
     motion_command: MotionCommand
     measured_distance: float
     measured_turn: float
@@ -299,6 +316,7 @@ class SimulationState:
     config: AppConfig
     rng: np.random.Generator
     walls: list[WallSegment]
+    truth_landmark_positions: list[np.ndarray]
     agent_state: AgentState
     slam_state: SlamState
     step_index: int = 0
@@ -403,6 +421,7 @@ def parse_config(raw_config: Mapping[str, Any]):
     plot = _require_mapping(raw["plot"], "plot")
     ekf = _require_mapping(raw["ekf"], "ekf")
     ekf_measurement = _require_mapping(ekf["measurement"], "ekf.measurement")
+    ekf_truth_update = _require_mapping(ekf["truth_update"], "ekf.truth_update")
 
     walls_raw = environment.get("walls", [])
     if not isinstance(walls_raw, Sequence) or isinstance(walls_raw, (str, bytes)):
@@ -498,7 +517,12 @@ def parse_config(raw_config: Mapping[str, Any]):
                 model_type=_require_choice(ekf_measurement["model_type"], "ekf.measurement.model_type", ("range_bearing",)),
                 range_std=_require_float(ekf_measurement["range_std"], "ekf.measurement.range_std"),
                 bearing_std_deg=_require_float(ekf_measurement["bearing_std_deg"], "ekf.measurement.bearing_std_deg"),
-            )
+            ),
+            truth_update=TruthUpdateConfig(
+                enabled=_require_bool(ekf_truth_update["enabled"], "ekf.truth_update.enabled"),
+                max_observations=_require_int(ekf_truth_update["max_observations"], "ekf.truth_update.max_observations"),
+                max_range=_require_float(ekf_truth_update["max_range"], "ekf.truth_update.max_range"),
+            ),
         ),
     )
 
@@ -640,14 +664,36 @@ def create_simulation(config: AppConfig | Mapping[str, Any]):
         config=config,
         rng=rng,
         walls=walls,
+        truth_landmark_positions=extract_truth_landmark_positions(walls),
         agent_state=initialize_agent_state(config.agent.initial_pose, config.agent.startup_behavior),
         slam_state=initialize_slam_state(config.agent.initial_pose),
+    )
+
+
+def extract_truth_landmarks_for_update(state: SimulationState):
+    return state.truth_landmark_positions
+
+
+def build_truth_observations(state: SimulationState, observation_pose: np.ndarray):
+    truth_update_config = state.config.ekf.truth_update
+    if not truth_update_config.enabled:
+        return None
+
+    return simulate_landmark_observations_from_truth(
+        observation_pose,
+        extract_truth_landmarks_for_update(state),
+        state.config.ekf.measurement,
+        state.config.sensor,
+        state.rng,
+        max_range=min(truth_update_config.max_range, state.config.sensor.max_range),
+        max_observations=truth_update_config.max_observations,
     )
 
 
 def step_simulation(state: SimulationState):
     current_frame = state.step_index + 1
     observation_pose = state.agent_state.true_pose.copy()
+    truth_observation_set = build_truth_observations(state, observation_pose)
     forward_sector_rad = np.radians(state.config.motion.front_sector_deg)
     lidar_scan = simulate_lidar(
         observation_pose[0],
@@ -720,6 +766,7 @@ def step_simulation(state: SimulationState):
         observation_pose=observation_pose,
         lidar_scan=lidar_scan,
         observed_landmarks=observed_landmarks,
+        truth_observation_set=truth_observation_set,
         motion_command=command,
         measured_distance=measured_distance,
         measured_turn=measured_turn,

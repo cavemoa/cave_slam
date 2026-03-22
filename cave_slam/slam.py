@@ -50,6 +50,12 @@ class LandmarkObservation:
     source_id: int | None = None
 
 
+@dataclass(frozen=True)
+class TruthObservationSet:
+    observations: list[LandmarkObservation]
+    landmark_positions: list[np.ndarray]
+
+
 @dataclass
 class VoxelCellState:
     sum_w: float = 0.0
@@ -141,6 +147,61 @@ def innovation_range_bearing(z: np.ndarray, z_hat: np.ndarray):
     innovation = np.asarray(z, dtype=float) - np.asarray(z_hat, dtype=float)
     innovation[1] = normalize_angle(float(innovation[1]))
     return innovation
+
+
+def extract_truth_landmark_positions(walls: Sequence[WallSegment], merge_tolerance: float = 1e-6):
+    truth_landmarks: list[np.ndarray] = []
+
+    for wall in walls:
+        for point in (wall.start, wall.end):
+            point_array = np.array(point, dtype=float)
+            if any(np.linalg.norm(point_array - existing) <= merge_tolerance for existing in truth_landmarks):
+                continue
+            truth_landmarks.append(point_array)
+
+    return truth_landmarks
+
+
+def simulate_landmark_observations_from_truth(
+    pose: np.ndarray,
+    landmark_positions: Sequence[np.ndarray],
+    measurement_config: MeasurementModelConfig,
+    sensor_config: SensorConfig,
+    rng,
+    max_range: float,
+    max_observations: int,
+):
+    if measurement_config.model_type != "range_bearing":
+        raise ValueError(f"Unsupported measurement model type: {measurement_config.model_type}")
+
+    if max_observations <= 0:
+        return TruthObservationSet(observations=[], landmark_positions=[])
+
+    half_fov = np.radians(sensor_config.fov_degrees / 2.0)
+    visible_observations: list[tuple[float, LandmarkObservation]] = []
+
+    for source_id, landmark_position in enumerate(landmark_positions):
+        predicted_measurement = predict_range_bearing(pose, landmark_position)
+        predicted_range = float(predicted_measurement[0])
+        predicted_bearing = float(predicted_measurement[1])
+
+        if predicted_range > max_range or abs(predicted_bearing) > half_fov:
+            continue
+
+        noisy_range = max(0.0, rng.normal(predicted_range, measurement_config.range_std))
+        noisy_bearing = normalize_angle(rng.normal(predicted_bearing, np.radians(measurement_config.bearing_std_deg)))
+        observation = LandmarkObservation(
+            range=noisy_range,
+            bearing=noisy_bearing,
+            world_position=np.array(landmark_position, dtype=float),
+            source_id=source_id,
+        )
+        visible_observations.append((predicted_range, observation))
+
+    visible_observations.sort(key=lambda item: item[0])
+    selected_observations = [item[1] for item in visible_observations[:max_observations]]
+    selected_positions = [np.array(observation.world_position, dtype=float) for observation in selected_observations]
+    return TruthObservationSet(observations=selected_observations, landmark_positions=selected_positions)
 
 
 def get_intersection(ray_origin, ray_dir, wall: WallSegment):
