@@ -85,8 +85,12 @@ def _build_ekf_diagnostics_text(state: SimulationState):
     debug_info = state.last_step_result.ekf_debug_info
     association_result = state.last_step_result.association_result
     track_count = state.last_step_result.landmark_track_count
+    augmented_count = len(state.last_step_result.augmented_landmark_track_ids)
     return (
-        f"Tracks={track_count}"
+        f"EKF={state.config.ekf.mode}"
+        f" | state={len(state.slam_state.mu)}"
+        f" | Tracks={track_count}"
+        f" | aug={augmented_count}"
         f" | Assoc={association_result.method}"
         f" m={len(association_result.matched)}"
         f" u={len(association_result.unmatched_observations)}"

@@ -44,6 +44,25 @@ class LandmarkTrackState:
     next_track_id: int = 0
 
 
+@dataclass(frozen=True)
+class TrackAssignment:
+    observation_index: int
+    track_id: int
+    created: bool
+
+
+@dataclass
+class TrackUpdateResult:
+    track_state: LandmarkTrackState
+    assignments: tuple[TrackAssignment, ...]
+
+
+@dataclass
+class EkfSlamStateIndex:
+    track_id_to_index: dict[int, int]
+    state_track_ids: list[int]
+
+
 @dataclass
 class LidarScan:
     measurements: list[ScanMeasurement]
@@ -278,6 +297,28 @@ def observation_to_measurement_vector(observation: LandmarkObservation):
     return np.array([observation.range, observation.bearing], dtype=float)
 
 
+def initialize_ekf_slam_state_index():
+    return EkfSlamStateIndex(track_id_to_index={}, state_track_ids=[])
+
+
+def get_landmark_state_index(state_index: EkfSlamStateIndex, track_id: int):
+    return state_index.track_id_to_index.get(track_id)
+
+
+def get_landmark_state_position(
+    mu: np.ndarray,
+    track: LandmarkTrack,
+    state_index: EkfSlamStateIndex | None = None,
+):
+    if state_index is None:
+        return np.asarray(track.position, dtype=float)
+
+    landmark_index = get_landmark_state_index(state_index, track.track_id)
+    if landmark_index is None:
+        return np.asarray(track.position, dtype=float)
+    return np.asarray(mu[landmark_index:landmark_index + 2], dtype=float)
+
+
 def compute_mahalanobis_distance(innovation: np.ndarray, innovation_covariance: np.ndarray):
     innovation_covariance = symmetrize_covariance(np.asarray(innovation_covariance, dtype=float))
     inverse_covariance = np.linalg.inv(innovation_covariance)
@@ -306,6 +347,8 @@ def associate_landmarks_nearest_neighbor(
     track_state: LandmarkTrackState,
     max_distance: float,
     min_track_quality: float,
+    mu: np.ndarray | None = None,
+    state_index: EkfSlamStateIndex | None = None,
 ):
     if not observations:
         return _build_empty_association_result(method="nearest_neighbor", gating_applied=False)
@@ -325,7 +368,12 @@ def associate_landmarks_nearest_neighbor(
             if observation.world_position is None:
                 continue
 
-            distance = _candidate_distance(observation, track)
+            landmark_position = get_landmark_state_position(
+                np.asarray(mu, dtype=float) if mu is not None else track.position,
+                track,
+                state_index,
+            )
+            distance = float(np.linalg.norm(np.asarray(observation.world_position, dtype=float) - landmark_position))
             if distance <= best_distance:
                 best_distance = distance
                 best_track = track
@@ -363,6 +411,7 @@ def associate_landmarks_mahalanobis(
     max_distance: float,
     mahalanobis_threshold: float,
     min_track_quality: float,
+    state_index: EkfSlamStateIndex | None = None,
 ):
     if not observations:
         return _build_empty_association_result(method="mahalanobis", gating_applied=True)
@@ -380,13 +429,23 @@ def associate_landmarks_mahalanobis(
             if track.track_id in used_track_ids or track.quality_score < min_track_quality:
                 continue
 
-            candidate_distance = _candidate_distance(observation, track)
+            landmark_position = get_landmark_state_position(mu, track, state_index)
+            candidate_distance = (
+                float(np.linalg.norm(np.asarray(observation.world_position, dtype=float) - landmark_position))
+                if observation.world_position is not None
+                else float("inf")
+            )
             if np.isfinite(candidate_distance) and candidate_distance > max_distance:
                 continue
 
-            z_hat = predict_range_bearing(mu, track.position)
+            z_hat = predict_range_bearing(mu, landmark_position)
             innovation = innovation_range_bearing(z, z_hat)
-            H = range_bearing_jacobian_pose(mu, track.position)
+            landmark_index = None if state_index is None else get_landmark_state_index(state_index, track.track_id)
+            if landmark_index is None:
+                H = np.zeros((2, len(mu)), dtype=float)
+                H[:, :3] = range_bearing_jacobian_pose(mu, landmark_position)
+            else:
+                H = range_bearing_jacobian_full_state(mu, landmark_index)
             R = measurement_noise_matrix(measurement_config)
             innovation_covariance = H @ Sigma @ H.T + R
             mahalanobis_distance = compute_mahalanobis_distance(innovation, innovation_covariance)
@@ -496,6 +555,122 @@ def ekf_update_pose_only_batch(
         update_results.append(update_result)
 
     return updated_mu, updated_Sigma, update_results
+
+
+def predict_landmark_from_observation(mu_pose: np.ndarray, observation: LandmarkObservation):
+    heading = float(mu_pose[2] + observation.bearing)
+    return np.array(
+        [
+            mu_pose[0] + observation.range * np.cos(heading),
+            mu_pose[1] + observation.range * np.sin(heading),
+        ],
+        dtype=float,
+    )
+
+
+def range_bearing_jacobian_landmark(mu: np.ndarray, landmark_position: np.ndarray):
+    dx = float(landmark_position[0] - mu[0])
+    dy = float(landmark_position[1] - mu[1])
+    squared_range = dx * dx + dy * dy
+    if squared_range < 1e-12:
+        raise ValueError("Landmark is too close to the robot pose for a stable landmark Jacobian.")
+
+    predicted_range = float(np.sqrt(squared_range))
+    return np.array(
+        [
+            [dx / predicted_range, dy / predicted_range],
+            [-dy / squared_range, dx / squared_range],
+        ],
+        dtype=float,
+    )
+
+
+def range_bearing_jacobian_full_state(mu: np.ndarray, landmark_index: int):
+    if landmark_index < 3 or landmark_index + 1 >= len(mu):
+        raise IndexError("landmark_index must point to the first element of a 2D landmark in the EKF state.")
+
+    landmark_position = np.asarray(mu[landmark_index:landmark_index + 2], dtype=float)
+    H = np.zeros((2, len(mu)), dtype=float)
+    H[:, :3] = range_bearing_jacobian_pose(mu, landmark_position)
+    H[:, landmark_index:landmark_index + 2] = range_bearing_jacobian_landmark(mu, landmark_position)
+    return H
+
+
+def augment_state_with_landmark(
+    mu: np.ndarray,
+    Sigma: np.ndarray,
+    observation: LandmarkObservation,
+    measurement_config: MeasurementModelConfig,
+):
+    pose = np.asarray(mu[:3], dtype=float)
+    landmark_position = predict_landmark_from_observation(pose, observation)
+    heading = float(pose[2] + observation.bearing)
+
+    J_pose = np.array(
+        [
+            [1.0, 0.0, -observation.range * np.sin(heading)],
+            [0.0, 1.0, observation.range * np.cos(heading)],
+        ],
+        dtype=float,
+    )
+    J_measurement = np.array(
+        [
+            [np.cos(heading), -observation.range * np.sin(heading)],
+            [np.sin(heading), observation.range * np.cos(heading)],
+        ],
+        dtype=float,
+    )
+
+    R = measurement_noise_matrix(measurement_config)
+    state_size = len(mu)
+    augmented_mu = np.concatenate([np.asarray(mu, dtype=float), landmark_position])
+
+    augmented_Sigma = np.zeros((state_size + 2, state_size + 2), dtype=float)
+    augmented_Sigma[:state_size, :state_size] = Sigma
+
+    pose_cross_covariance = np.asarray(Sigma[:3, :], dtype=float)
+    landmark_cross_covariance = J_pose @ pose_cross_covariance
+    landmark_covariance = J_pose @ Sigma[:3, :3] @ J_pose.T + J_measurement @ R @ J_measurement.T
+
+    augmented_Sigma[state_size:, :state_size] = landmark_cross_covariance
+    augmented_Sigma[:state_size, state_size:] = landmark_cross_covariance.T
+    augmented_Sigma[state_size:, state_size:] = landmark_covariance
+    augmented_Sigma = ensure_positive_semidefinite(augmented_Sigma)
+    return normalize_state_angle(augmented_mu), augmented_Sigma
+
+
+def ekf_update_full_state(
+    mu: np.ndarray,
+    Sigma: np.ndarray,
+    observation: LandmarkObservation,
+    landmark_index: int,
+    measurement_config: MeasurementModelConfig,
+):
+    landmark_position = np.asarray(mu[landmark_index:landmark_index + 2], dtype=float)
+    z = observation_to_measurement_vector(observation)
+    z_hat = predict_range_bearing(mu, landmark_position)
+    H = range_bearing_jacobian_full_state(mu, landmark_index)
+    R = measurement_noise_matrix(measurement_config)
+
+    innovation = innovation_range_bearing(z, z_hat)
+    S = H @ Sigma @ H.T + R
+    S = symmetrize_covariance(S)
+    S_inv = np.linalg.inv(S)
+    K = Sigma @ H.T @ S_inv
+
+    updated_mu = np.array(mu, dtype=float, copy=True)
+    updated_mu = updated_mu + K @ innovation
+    updated_mu = normalize_state_angle(updated_mu)
+
+    updated_Sigma = joseph_covariance_update(Sigma, K, H, R)
+    nis = float(innovation.T @ S_inv @ innovation)
+    return EkfUpdateResult(
+        mu=updated_mu,
+        Sigma=updated_Sigma,
+        innovation=innovation,
+        kalman_gain=K,
+        nis=nis,
+    )
 
 
 def extract_truth_landmark_positions(walls: Sequence[WallSegment], merge_tolerance: float = 1e-6):
@@ -813,11 +988,16 @@ def update_landmark_track(
     return track
 
 
-def prune_landmark_tracks(track_state: LandmarkTrackState, frame_index: int):
+def prune_landmark_tracks(
+    track_state: LandmarkTrackState,
+    frame_index: int,
+    protected_track_ids: Sequence[int] = (),
+):
+    protected_track_ids = set(protected_track_ids)
     expired_track_ids: list[int] = []
     for track_id, track in track_state.tracks.items():
         staleness_frames = max(0, frame_index - track.last_seen_frame)
-        if staleness_frames > track.ttl:
+        if staleness_frames > track.ttl and track_id not in protected_track_ids:
             expired_track_ids.append(track_id)
             continue
         track.quality_score = _compute_track_quality(track.observation_count, staleness_frames, track.ttl)
@@ -830,36 +1010,73 @@ def prune_landmark_tracks(track_state: LandmarkTrackState, frame_index: int):
 
 def update_landmark_track_state(
     world_points: Sequence[np.ndarray],
+    association_result: AssociationResult,
     track_state: LandmarkTrackState,
     frame_index: int,
     feature_config: FeatureExtractionConfig,
+    protected_track_ids: Sequence[int] = (),
 ):
-    prune_landmark_tracks(track_state, frame_index)
-    matched_track_ids: set[int] = set()
+    prune_landmark_tracks(track_state, frame_index, protected_track_ids)
+    assignments: list[TrackAssignment] = []
+    matched_observation_indices: set[int] = set()
+    used_track_ids: set[int] = set()
 
-    for point in world_points:
+    for match in association_result.matched:
+        track = track_state.tracks.get(match.track_id)
+        if track is None or match.observation_index >= len(world_points):
+            continue
+
+        point_array = np.asarray(world_points[match.observation_index], dtype=float)
+        update_landmark_track(track, point_array, frame_index, feature_config)
+        assignments.append(TrackAssignment(observation_index=match.observation_index, track_id=track.track_id, created=False))
+        matched_observation_indices.add(match.observation_index)
+        used_track_ids.add(track.track_id)
+
+    for observation_index, point in enumerate(world_points):
+        if observation_index in matched_observation_indices:
+            continue
+
         point_array = np.asarray(point, dtype=float)
         best_track = None
         best_distance = feature_config.association_radius
-
         for track in track_state.tracks.values():
-            if track.track_id in matched_track_ids:
+            if track.track_id in protected_track_ids or track.track_id in used_track_ids:
                 continue
-
             distance = float(np.linalg.norm(point_array - track.position))
             if distance <= best_distance:
                 best_distance = distance
                 best_track = track
 
-        if best_track is None:
+        if best_track is not None:
+            update_landmark_track(best_track, point_array, frame_index, feature_config)
+            assignments.append(TrackAssignment(observation_index=observation_index, track_id=best_track.track_id, created=False))
+            used_track_ids.add(best_track.track_id)
+        else:
             track_id = track_state.next_track_id
             track_state.tracks[track_id] = create_landmark_track(point_array, frame_index, feature_config, track_id)
             track_state.next_track_id += 1
-            matched_track_ids.add(track_id)
-            continue
+            assignments.append(TrackAssignment(observation_index=observation_index, track_id=track_id, created=True))
+            used_track_ids.add(track_id)
 
-        update_landmark_track(best_track, point_array, frame_index, feature_config)
-        matched_track_ids.add(best_track.track_id)
+    return TrackUpdateResult(track_state=track_state, assignments=tuple(assignments))
+
+
+def sync_landmark_tracks_with_state(
+    track_state: LandmarkTrackState,
+    state_index: EkfSlamStateIndex,
+    mu: np.ndarray,
+    Sigma: np.ndarray,
+):
+    for track_id, landmark_index in state_index.track_id_to_index.items():
+        track = track_state.tracks.get(track_id)
+        if track is None or landmark_index + 1 >= len(mu):
+            continue
+        track.position = np.array(mu[landmark_index:landmark_index + 2], dtype=float, copy=True)
+        track.covariance = np.array(
+            Sigma[landmark_index:landmark_index + 2, landmark_index:landmark_index + 2],
+            dtype=float,
+            copy=True,
+        )
 
     return track_state
 

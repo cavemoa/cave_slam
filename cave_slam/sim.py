@@ -13,6 +13,7 @@ from .agent import AgentState, MotionCommand, initialize_agent_state, step_agent
 from .slam import (
     AssociationResult,
     EkfDebugInfo,
+    EkfSlamStateIndex,
     EkfStepDiagnostics,
     LidarScan,
     EkfUpdateResult,
@@ -25,17 +26,23 @@ from .slam import (
     WallSegment,
     associate_landmarks_mahalanobis,
     associate_landmarks_nearest_neighbor,
+    augment_state_with_landmark,
     build_ekf_step_diagnostics,
     compute_ekf_debug_info,
     ekf_predict,
+    ekf_update_full_state,
     ekf_update_pose_only_batch,
     extract_landmarks,
     extract_truth_landmark_positions,
+    get_landmark_state_index,
+    initialize_ekf_slam_state_index,
     initialize_landmark_track_state,
     measurements_to_world_points,
     simulate_lidar,
     simulate_landmark_observations_from_truth,
+    sync_landmark_tracks_with_state,
     transform_measurements,
+    TrackUpdateResult,
     update_landmark_track_state,
     update_persistent_landmarks,
     update_voxel_grid,
@@ -131,6 +138,7 @@ DEFAULT_CONFIG = {
         "point_alpha": 0.08,
     },
     "ekf": {
+        "mode": "pose_only",
         "measurement": {
             "model_type": "range_bearing",
             "range_std": 0.05,
@@ -301,6 +309,7 @@ class AssociationConfig:
 
 @dataclass(frozen=True)
 class EkfConfig:
+    mode: str
     measurement: MeasurementModelConfig
     truth_update: TruthUpdateConfig
     pose_update: PoseUpdateConfig
@@ -325,6 +334,7 @@ class AppConfig:
 class SlamState:
     mu: np.ndarray
     Sigma: np.ndarray
+    ekf_slam_index: EkfSlamStateIndex
     point_cloud_x: list[float]
     point_cloud_y: list[float]
     voxel_points_x: list[float]
@@ -351,6 +361,7 @@ class StepResult:
     measured_distance: float
     measured_turn: float
     pose_update_results: list[EkfUpdateResult]
+    augmented_landmark_track_ids: tuple[int, ...]
     ekf_diagnostics: EkfStepDiagnostics
     ekf_debug_info: EkfDebugInfo
 
@@ -560,6 +571,7 @@ def parse_config(raw_config: Mapping[str, Any]):
             point_alpha=_require_float(plot["point_alpha"], "plot.point_alpha"),
         ),
         ekf=EkfConfig(
+            mode=_require_choice(ekf["mode"], "ekf.mode", ("pose_only", "full_slam")),
             measurement=MeasurementModelConfig(
                 model_type=_require_choice(ekf_measurement["model_type"], "ekf.measurement.model_type", ("range_bearing",)),
                 range_std=_require_float(ekf_measurement["range_std"], "ekf.measurement.range_std"),
@@ -688,6 +700,7 @@ def initialize_slam_state(initial_pose: InitialPoseConfig):
     return SlamState(
         mu=mu,
         Sigma=sigma,
+        ekf_slam_index=initialize_ekf_slam_state_index(),
         point_cloud_x=[],
         point_cloud_y=[],
         voxel_points_x=[],
@@ -781,6 +794,8 @@ def associate_feature_observations(
             track_state,
             max_distance=association_config.max_distance,
             min_track_quality=association_config.min_track_quality,
+            mu=state.slam_state.mu,
+            state_index=state.slam_state.ekf_slam_index,
         )
 
     return associate_landmarks_mahalanobis(
@@ -792,6 +807,7 @@ def associate_feature_observations(
         max_distance=association_config.max_distance,
         mahalanobis_threshold=association_config.mahalanobis_threshold,
         min_track_quality=association_config.min_track_quality,
+        state_index=state.slam_state.ekf_slam_index,
     )
 
 
@@ -806,6 +822,76 @@ def extract_associated_track_positions(
             continue
         associated_positions.append(np.array(track.position, dtype=float, copy=True))
     return associated_positions
+
+
+def _register_augmented_landmark(state: SimulationState, track_id: int):
+    landmark_index = len(state.slam_state.mu) - 2
+    state.slam_state.ekf_slam_index.track_id_to_index[track_id] = landmark_index
+    if track_id not in state.slam_state.ekf_slam_index.state_track_ids:
+        state.slam_state.ekf_slam_index.state_track_ids.append(track_id)
+    return landmark_index
+
+
+def apply_full_slam_correction(
+    state: SimulationState,
+    feature_observations: Sequence[LandmarkObservation],
+    association_result: AssociationResult,
+    track_update_result: TrackUpdateResult,
+):
+    pose_update_config = state.config.ekf.pose_update
+    if not pose_update_config.enabled:
+        return [], ()
+
+    max_updates = max(0, pose_update_config.max_updates_per_frame)
+    if max_updates == 0:
+        return [], ()
+    update_results: list[EkfUpdateResult] = []
+    augmented_track_ids: list[int] = []
+
+    for match in association_result.matched[:max_updates]:
+        landmark_index = get_landmark_state_index(state.slam_state.ekf_slam_index, match.track_id)
+        observation = feature_observations[match.observation_index]
+
+        if landmark_index is None:
+            state.slam_state.mu, state.slam_state.Sigma = augment_state_with_landmark(
+                state.slam_state.mu,
+                state.slam_state.Sigma,
+                observation,
+                state.config.ekf.measurement,
+            )
+            _register_augmented_landmark(state, match.track_id)
+            augmented_track_ids.append(match.track_id)
+            continue
+
+        update_result = ekf_update_full_state(
+            state.slam_state.mu,
+            state.slam_state.Sigma,
+            observation,
+            landmark_index,
+            state.config.ekf.measurement,
+        )
+        state.slam_state.mu = update_result.mu
+        state.slam_state.Sigma = update_result.Sigma
+        update_results.append(update_result)
+
+    for assignment in track_update_result.assignments:
+        if not assignment.created:
+            continue
+        if get_landmark_state_index(state.slam_state.ekf_slam_index, assignment.track_id) is not None:
+            continue
+        if assignment.observation_index >= len(feature_observations):
+            continue
+
+        state.slam_state.mu, state.slam_state.Sigma = augment_state_with_landmark(
+            state.slam_state.mu,
+            state.slam_state.Sigma,
+            feature_observations[assignment.observation_index],
+            state.config.ekf.measurement,
+        )
+        _register_augmented_landmark(state, assignment.track_id)
+        augmented_track_ids.append(assignment.track_id)
+
+    return update_results, tuple(augmented_track_ids)
 
 
 def apply_pose_only_ekf_correction(
@@ -876,12 +962,15 @@ def step_simulation(state: SimulationState):
         slam_state.persistent_landmarks,
         state.config.feature_extraction,
     )
-    slam_state.landmark_track_state = update_landmark_track_state(
+    track_update_result = update_landmark_track_state(
         observed_landmark_points,
+        association_result,
         slam_state.landmark_track_state,
         current_frame,
         state.config.feature_extraction,
+        protected_track_ids=tuple(slam_state.ekf_slam_index.state_track_ids),
     )
+    slam_state.landmark_track_state = track_update_result.track_state
 
     mapped_x, mapped_y = transform_measurements(lidar_scan.measurements, slam_state.mu)
     slam_state.point_cloud_x.extend(mapped_x)
@@ -924,19 +1013,36 @@ def step_simulation(state: SimulationState):
     )
     pre_update_mu = slam_state.mu.copy()
     pre_update_sigma = slam_state.Sigma.copy()
-    pose_update_results = apply_pose_only_ekf_correction(
-        state,
-        truth_observation_set,
-        feature_observations,
-        association_result,
-        associated_track_positions,
-    )
-    if state.config.ekf.pose_update.use_truth_observations:
-        num_candidate_observations = len(truth_observation_set.observations) if truth_observation_set is not None else 0
-        num_rejections = 0
-    else:
+    augmented_landmark_track_ids: tuple[int, ...] = ()
+    if state.config.ekf.mode == "full_slam":
+        pose_update_results, augmented_landmark_track_ids = apply_full_slam_correction(
+            state,
+            feature_observations,
+            association_result,
+            track_update_result,
+        )
         num_candidate_observations = len(feature_observations)
         num_rejections = len(association_result.rejected)
+        slam_state.landmark_track_state = sync_landmark_tracks_with_state(
+            slam_state.landmark_track_state,
+            slam_state.ekf_slam_index,
+            slam_state.mu,
+            slam_state.Sigma,
+        )
+    else:
+        pose_update_results = apply_pose_only_ekf_correction(
+            state,
+            truth_observation_set,
+            feature_observations,
+            association_result,
+            associated_track_positions,
+        )
+        if state.config.ekf.pose_update.use_truth_observations:
+            num_candidate_observations = len(truth_observation_set.observations) if truth_observation_set is not None else 0
+            num_rejections = 0
+        else:
+            num_candidate_observations = len(feature_observations)
+            num_rejections = len(association_result.rejected)
     ekf_diagnostics = build_ekf_step_diagnostics(
         pose_before_update=pre_update_mu,
         pose_after_update=slam_state.mu,
@@ -966,6 +1072,7 @@ def step_simulation(state: SimulationState):
         measured_distance=measured_distance,
         measured_turn=measured_turn,
         pose_update_results=pose_update_results,
+        augmented_landmark_track_ids=augmented_landmark_track_ids,
         ekf_diagnostics=ekf_diagnostics,
         ekf_debug_info=ekf_debug_info,
     )

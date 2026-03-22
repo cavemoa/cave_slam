@@ -5,7 +5,7 @@
 - procedural cave-like environment generation
 - a simple 2D lidar model with configurable noise
 - corner-style feature extraction from lidar returns
-- a basic EKF prediction step driven by noisy odometry
+- EKF-based state estimation with pose-only and full EKF-SLAM modes
 - accumulated point-cloud mapping with voxel-grid averaging
 - a reactive agent controller with obstacle avoidance
 
@@ -23,6 +23,10 @@ Detailed EKF development planning is documented here:
 
 - [documentation/ekf_roadmap.md](/home/jon/cave_slam/documentation/ekf_roadmap.md)
 
+Detailed EKF implementation notes are documented here:
+
+- [EKF.md](/home/jon/cave_slam/EKF.md)
+
 The original monolithic reference version is preserved here:
 
 - [cave_slam_2.py](/home/jon/cave_slam/cave_slam_2.py)
@@ -36,6 +40,7 @@ Older exploratory scripts are stored in:
 ```text
 cave_slam/
 ├── README.md
+├── EKF.md
 ├── cave_slam.yaml
 ├── cave_slam_2.py
 ├── cave_slam_3.py
@@ -58,9 +63,10 @@ cave_slam/
   - lidar ray casting and measurement generation
   - sensor noise model
   - landmark extraction from local scan geometry
+  - landmark track, association, and gating logic
   - point-cloud transformation
   - voxel-grid aggregation
-  - EKF prediction math
+  - EKF prediction, pose-only correction, and full-state augmentation math
 
 - [cave_slam/agent.py](/home/jon/cave_slam/cave_slam/agent.py)
   - agent motion state
@@ -172,12 +178,15 @@ At a high level, each animation frame follows this loop:
 1. The agent pose is used to simulate a lidar scan against the wall geometry.
 2. The scan is converted into local measurements.
 3. Corner-like landmarks are extracted from the scan.
-4. Measurements are transformed into world coordinates using the current EKF pose.
-5. The point cloud is accumulated and averaged into a voxel grid.
-6. The agent controller chooses a motion command.
-7. Odometry noise is added to the command.
-8. The EKF prediction step updates the estimated pose.
-9. Matplotlib artists are refreshed for display.
+4. Feature observations are associated to the landmark track layer.
+5. The landmark track layer is updated and may create new landmark tracks.
+6. Measurements are transformed into world coordinates using the current EKF pose.
+7. The point cloud is accumulated and averaged into a voxel grid.
+8. The agent controller chooses a motion command.
+9. Odometry noise is added to the command.
+10. The EKF prediction step updates the estimated pose.
+11. Depending on `ekf.mode`, the estimator performs either pose-only correction or full EKF-SLAM landmark augmentation and update.
+12. Matplotlib artists are refreshed for display.
 
 The first eight steps are now handled by the headless simulation engine in [cave_slam/sim.py](/home/jon/cave_slam/cave_slam/sim.py). The final display step is handled separately in [cave_slam/viz.py](/home/jon/cave_slam/cave_slam/viz.py).
 
@@ -214,7 +223,15 @@ The current feature extraction stage looks for corner-like structures in the ord
 - checking span, continuity, residual error, and corner angle
 - applying non-maximum suppression to avoid dense duplicate detections
 
-Detected landmarks are persisted across frames with a simple TTL-based association rule.
+Detected landmarks are also passed into a separate landmark track layer used by the estimator. That track layer maintains:
+
+- stable integer track IDs
+- running landmark positions
+- observation counts
+- last-seen frame tracking
+- track quality scores
+
+The old visual persistence layer is still used for display, but EKF association now works against the dedicated track layer rather than the display-only landmark list.
 
 ### Mapping
 
@@ -266,19 +283,30 @@ The current avoidance strategy is a weighted freer-side selector:
 
 This avoids the per-frame oscillation that occurs if the controller randomly re-chooses left or right every update.
 
-### EKF State Prediction
+### EKF Estimation
 
-The EKF implementation in this project is prediction-only. It uses:
+The estimator now supports two runtime modes:
 
-- commanded distance with added noise
-- commanded turn with added noise
+- `pose_only`
+  - the EKF state is just robot pose `[x, y, theta]`
+  - corrections can use either the truth harness or associated landmark tracks
+- `full_slam`
+  - the EKF state is augmented to `[x, y, theta, l1x, l1y, l2x, l2y, ...]`
+  - matched tracked landmarks receive full-state EKF updates
+  - newly created tracks can be inserted into the EKF state through landmark augmentation
 
-to propagate:
+The key EKF features currently implemented are:
 
-- estimated pose `mu`
-- pose covariance `Sigma`
+- prediction hardening with angle normalization and covariance repair
+- range-bearing measurement model
+- truth-landmark observation harness for controlled testing
+- landmark track layer with stable track IDs
+- nearest-neighbor and Mahalanobis association modes
+- pose-only EKF correction
+- full EKF-SLAM state augmentation and full-state landmark updates
+- per-step EKF diagnostics and live overlay text
 
-There is currently no explicit measurement-update stage for landmark corrections. That means the EKF estimate is essentially an odometry-driven prediction track rather than a full closed-loop SLAM estimator.
+See [EKF.md](/home/jon/cave_slam/EKF.md) for a detailed estimator description.
 
 ## Running the Refactored Version
 
@@ -316,6 +344,7 @@ for _ in range(100):
 ```
 
 `step_simulation()` returns a typed `StepResult` object containing the frame observation pose, lidar scan, extracted landmarks, chosen motion command, and noisy odometry values.
+It also includes association results, EKF diagnostics, and any landmark track IDs that were augmented into the EKF state during that frame.
 
 ## Configuration
 
@@ -332,6 +361,7 @@ The main typed config root is `AppConfig`, which contains nested config sections
 - `VoxelGridConfig`
 - `AgentConfig`
 - `PlotConfig`
+- `EkfConfig`
 
 ### `simulation`
 
@@ -509,6 +539,53 @@ Recommended tuning guidance:
 - `point_alpha`
   - raw point cloud transparency
 
+### `ekf`
+
+- `mode`
+  - either `pose_only` or `full_slam`
+  - `pose_only` keeps the EKF state at size `3`
+  - `full_slam` augments the EKF state with landmark positions
+
+### `ekf.measurement`
+
+- `model_type`
+  - currently `range_bearing`
+- `range_std`
+  - measurement standard deviation for range
+- `bearing_std_deg`
+  - measurement standard deviation for bearing in degrees
+
+### `ekf.truth_update`
+
+- `enabled`
+  - enables the truth landmark harness
+- `max_observations`
+  - maximum number of truth landmarks used per frame
+- `max_range`
+  - truth landmark visibility range cap
+
+### `ekf.pose_update`
+
+- `enabled`
+  - enables estimator correction
+- `use_truth_observations`
+  - when `true` in `pose_only` mode, use truth harness observations
+  - when `false` in `pose_only` mode, use associated landmark tracks
+  - `full_slam` mode uses associated landmark tracks regardless
+- `max_updates_per_frame`
+  - maximum number of correction updates applied per frame
+
+### `ekf.association`
+
+- `method`
+  - `nearest_neighbor` or `mahalanobis`
+- `max_distance`
+  - Euclidean candidate-distance filter for track association
+- `mahalanobis_threshold`
+  - gating threshold used by Mahalanobis association
+- `min_track_quality`
+  - minimum landmark-track quality required before a track can be associated
+
 ## Outputs and Visual Elements
 
 The visualization currently shows:
@@ -521,6 +598,18 @@ The visualization currently shows:
 - a magenta line for the EKF predicted trajectory
 - a red marker and heading for the true pose
 - a magenta marker and heading for the estimated pose
+- a live EKF diagnostics panel with:
+  - estimator mode
+  - state size
+  - active track count
+  - augmentation count
+  - association summary
+  - covariance and NIS summaries
+
+The visual runner also supports:
+
+- `space`
+  - pause or resume the animation
 
 ## Design Notes
 
@@ -542,8 +631,11 @@ More recently, plotting was separated again into [cave_slam/viz.py](/home/jon/ca
 
 ## Known Limitations
 
-- The EKF currently performs prediction only and does not yet incorporate a correction step from landmarks.
-- The map is an accumulated visualization, not a globally optimized SLAM backend.
+- The estimator is still an educational EKF-SLAM implementation rather than a production-grade SLAM backend.
+- The current landmark model uses extracted corner-like scan features and simple track management, so association quality depends heavily on scan geometry and tuning.
+- `full_slam` currently augments landmarks into the EKF state, but it does not yet implement landmark removal, merging, or loop-closure machinery.
+- The simulation loop is optimized for experimentation and visualization rather than textbook robotics middleware timing.
+- The map is an accumulated visualization, not a globally optimized back-end map.
 - Obstacle avoidance is reactive rather than goal-directed.
 - The simulation is 2D only.
 - The interactive runtime is still tied to Matplotlib animation, so the visual mode is best suited to local use.
@@ -552,8 +644,10 @@ More recently, plotting was separated again into [cave_slam/viz.py](/home/jon/ca
 
 If you want to extend the project, the most natural next improvements are:
 
-- add an EKF measurement-update stage using persistent landmarks
-- add data association diagnostics and visualization
+- improve landmark lifecycle handling for augmented EKF-SLAM landmarks
+- add stronger outlier rejection and ambiguity handling around association
+- experiment with different landmark feature types
+- improve temporal consistency between the observation and motion-update parts of the simulation loop
 - expose more controller parameters in the YAML file
 - save trajectories and map snapshots for offline analysis
 - add unit tests for geometry, lidar, and controller helpers
