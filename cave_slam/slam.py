@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Sequence
 import numpy as np
 
 if TYPE_CHECKING:
-    from .sim import FeatureExtractionConfig, OdometryNoiseConfig, SensorConfig, VoxelGridConfig
+    from .sim import FeatureExtractionConfig, MeasurementModelConfig, OdometryNoiseConfig, SensorConfig, VoxelGridConfig
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,14 @@ class EkfDebugInfo:
     pose_std_x: float
     pose_std_y: float
     pose_std_theta: float
+
+
+@dataclass(frozen=True)
+class LandmarkObservation:
+    range: float
+    bearing: float
+    world_position: np.ndarray | None = None
+    source_id: int | None = None
 
 
 @dataclass
@@ -89,6 +97,50 @@ def compute_ekf_debug_info(Sigma: np.ndarray):
         pose_std_y=float(np.sqrt(diagonal[1])),
         pose_std_theta=float(np.sqrt(diagonal[2])),
     )
+
+
+def predict_range_bearing(mu: np.ndarray, landmark_position: np.ndarray):
+    dx = float(landmark_position[0] - mu[0])
+    dy = float(landmark_position[1] - mu[1])
+    squared_range = dx * dx + dy * dy
+    if squared_range < 1e-12:
+        raise ValueError("Landmark is too close to the robot pose for a stable range-bearing prediction.")
+
+    predicted_range = float(np.sqrt(squared_range))
+    predicted_bearing = normalize_angle(float(np.arctan2(dy, dx) - mu[2]))
+    return np.array([predicted_range, predicted_bearing], dtype=float)
+
+
+def range_bearing_jacobian_pose(mu: np.ndarray, landmark_position: np.ndarray):
+    dx = float(landmark_position[0] - mu[0])
+    dy = float(landmark_position[1] - mu[1])
+    squared_range = dx * dx + dy * dy
+    if squared_range < 1e-12:
+        raise ValueError("Landmark is too close to the robot pose for a stable measurement Jacobian.")
+
+    predicted_range = float(np.sqrt(squared_range))
+    return np.array(
+        [
+            [-dx / predicted_range, -dy / predicted_range, 0.0],
+            [dy / squared_range, -dx / squared_range, -1.0],
+        ],
+        dtype=float,
+    )
+
+
+def measurement_noise_matrix(config: MeasurementModelConfig):
+    if config.model_type != "range_bearing":
+        raise ValueError(f"Unsupported measurement model type: {config.model_type}")
+
+    range_variance = config.range_std ** 2
+    bearing_variance = np.radians(config.bearing_std_deg) ** 2
+    return np.array([[range_variance, 0.0], [0.0, bearing_variance]], dtype=float)
+
+
+def innovation_range_bearing(z: np.ndarray, z_hat: np.ndarray):
+    innovation = np.asarray(z, dtype=float) - np.asarray(z_hat, dtype=float)
+    innovation[1] = normalize_angle(float(innovation[1]))
+    return innovation
 
 
 def get_intersection(ray_origin, ray_dir, wall: WallSegment):

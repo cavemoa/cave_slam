@@ -116,6 +116,13 @@ DEFAULT_CONFIG = {
         "point_size": 10,
         "point_alpha": 0.08,
     },
+    "ekf": {
+        "measurement": {
+            "model_type": "range_bearing",
+            "range_std": 0.05,
+            "bearing_std_deg": 2.0,
+        },
+    },
 }
 
 
@@ -234,6 +241,18 @@ class PlotConfig:
 
 
 @dataclass(frozen=True)
+class MeasurementModelConfig:
+    model_type: str
+    range_std: float
+    bearing_std_deg: float
+
+
+@dataclass(frozen=True)
+class EkfConfig:
+    measurement: MeasurementModelConfig
+
+
+@dataclass(frozen=True)
 class AppConfig:
     simulation: SimulationConfig
     environment: EnvironmentConfig
@@ -244,6 +263,7 @@ class AppConfig:
     voxel_grid: VoxelGridConfig
     agent: AgentConfig
     plot: PlotConfig
+    ekf: EkfConfig
 
 
 @dataclass
@@ -381,6 +401,8 @@ def parse_config(raw_config: Mapping[str, Any]):
     initial_pose = _require_mapping(agent["initial_pose"], "agent.initial_pose")
     startup_behavior = _require_mapping(agent["startup_behavior"], "agent.startup_behavior")
     plot = _require_mapping(raw["plot"], "plot")
+    ekf = _require_mapping(raw["ekf"], "ekf")
+    ekf_measurement = _require_mapping(ekf["measurement"], "ekf.measurement")
 
     walls_raw = environment.get("walls", [])
     if not isinstance(walls_raw, Sequence) or isinstance(walls_raw, (str, bytes)):
@@ -470,6 +492,13 @@ def parse_config(raw_config: Mapping[str, Any]):
             ylim=_require_pair(plot["ylim"], "plot.ylim"),
             point_size=_require_float(plot["point_size"], "plot.point_size"),
             point_alpha=_require_float(plot["point_alpha"], "plot.point_alpha"),
+        ),
+        ekf=EkfConfig(
+            measurement=MeasurementModelConfig(
+                model_type=_require_choice(ekf_measurement["model_type"], "ekf.measurement.model_type", ("range_bearing",)),
+                range_std=_require_float(ekf_measurement["range_std"], "ekf.measurement.range_std"),
+                bearing_std_deg=_require_float(ekf_measurement["bearing_std_deg"], "ekf.measurement.bearing_std_deg"),
+            )
         ),
     )
 
