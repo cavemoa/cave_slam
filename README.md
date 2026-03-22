@@ -19,6 +19,10 @@ The current refactored entry point is:
 
 - [cave_slam_3.py](/home/jon/cave_slam/cave_slam_3.py)
 
+Detailed EKF development planning is documented here:
+
+- [documentation/ekf_roadmap.md](/home/jon/cave_slam/documentation/ekf_roadmap.md)
+
 The original monolithic reference version is preserved here:
 
 - [cave_slam_2.py](/home/jon/cave_slam/cave_slam_2.py)
