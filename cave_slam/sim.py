@@ -279,6 +279,7 @@ class SimulationState:
     agent_state: AgentState
     slam_state: SlamState
     step_index: int = 0
+    is_paused: bool = False
     artists: PlotArtists | None = None
     animation: object | None = None
 

@@ -11,6 +11,8 @@
 
 The project is intentionally lightweight. It is designed to be easy to modify, inspect, and use for experimentation rather than to serve as a production robotics stack.
 
+![Example Screenshot](images/screenshot.JPG)
+
 ## Project Status
 
 The current refactored entry point is:

@@ -23,6 +23,7 @@ class PlotArtists:
     ekf_marker: object
     true_heading: object
     ekf_heading: object
+    status_text: object
 
 
 def configure_matplotlib_backend():
@@ -45,6 +46,34 @@ def import_matplotlib_modules():
     import matplotlib.pyplot as plt
 
     return animation, plt
+
+
+def _get_environment_size_text(state: SimulationState):
+    if state.config.environment.generator.enabled:
+        width = state.config.environment.generator.width
+        height = state.config.environment.generator.height
+    else:
+        if not state.walls:
+            width = 0.0
+            height = 0.0
+        else:
+            xs = [coordinate for wall in state.walls for coordinate in (wall.start[0], wall.end[0])]
+            ys = [coordinate for wall in state.walls for coordinate in (wall.start[1], wall.end[1])]
+            width = max(xs) - min(xs)
+            height = max(ys) - min(ys)
+
+    return f"env={width:.1f}x{height:.1f}"
+
+
+def _build_status_text(state: SimulationState):
+    sensor = state.config.sensor
+    return (
+        f"fov={sensor.fov_degrees:g} deg"
+        f" | rays={sensor.num_rays}"
+        f" | max_range={sensor.max_range:g}"
+        f" | {_get_environment_size_text(state)}"
+        " | space: pause/resume"
+    )
 
 
 def create_plot(state: SimulationState):
@@ -71,8 +100,9 @@ def create_plot(state: SimulationState):
     true_heading, = ax.plot([], [], "r-", linewidth=2)
     ekf_heading, = ax.plot([], [], "m-", linewidth=2)
 
-    ax.legend(loc="upper left", bbox_to_anchor=(1, 1))
-    plt.tight_layout()
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=4, frameon=False)
+    status_text = fig.text(0.5, 0.04, _build_status_text(state), ha="center", va="center")
+    plt.tight_layout(rect=(0, 0.12, 1, 1))
 
     return PlotArtists(
         fig=fig,
@@ -86,6 +116,7 @@ def create_plot(state: SimulationState):
         ekf_marker=ekf_marker,
         true_heading=true_heading,
         ekf_heading=ekf_heading,
+        status_text=status_text,
     )
 
 
@@ -136,6 +167,8 @@ def render_simulation(state: SimulationState):
         [slam_state.mu[0], slam_state.mu[0] + heading_length * np.cos(slam_state.mu[2])],
         [slam_state.mu[1], slam_state.mu[1] + heading_length * np.sin(slam_state.mu[2])],
     )
+    pause_suffix = " [Paused]" if state.is_paused else ""
+    artists.status_text.set_text(_build_status_text(state) + pause_suffix)
 
     return (
         artists.scatter_cloud,
@@ -147,6 +180,7 @@ def render_simulation(state: SimulationState):
         artists.ekf_marker,
         artists.true_heading,
         artists.ekf_heading,
+        artists.status_text,
     )
 
 
@@ -171,5 +205,19 @@ def run_simulation(config: AppConfig | Mapping[str, object]):
         interval=max(0, state.config.simulation.delay_ms),
         blit=False,
     )
+
+    def on_key_press(event):
+        if event.key not in {" ", "space"} or state.animation is None:
+            return
+
+        state.is_paused = not state.is_paused
+        if state.is_paused:
+            state.animation.event_source.stop()
+        else:
+            state.animation.event_source.start()
+        render_simulation(state)
+        state.artists.fig.canvas.draw_idle()
+
+    state.artists.fig.canvas.mpl_connect("key_press_event", on_key_press)
     plt.show()
     return state
