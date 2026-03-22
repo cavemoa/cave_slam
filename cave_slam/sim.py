@@ -795,17 +795,46 @@ def associate_feature_observations(
     )
 
 
-def apply_pose_only_ekf_correction(state: SimulationState, truth_observation_set: TruthObservationSet | None):
+def extract_associated_track_positions(
+    track_state: LandmarkTrackState,
+    association_result: AssociationResult,
+):
+    associated_positions: list[np.ndarray] = []
+    for match in association_result.matched:
+        track = track_state.tracks.get(match.track_id)
+        if track is None:
+            continue
+        associated_positions.append(np.array(track.position, dtype=float, copy=True))
+    return associated_positions
+
+
+def apply_pose_only_ekf_correction(
+    state: SimulationState,
+    truth_observation_set: TruthObservationSet | None,
+    feature_observations: Sequence[LandmarkObservation],
+    association_result: AssociationResult,
+    associated_track_positions: Sequence[np.ndarray],
+):
     pose_update_config = state.config.ekf.pose_update
-    if not pose_update_config.enabled or not pose_update_config.use_truth_observations or truth_observation_set is None:
+    if not pose_update_config.enabled:
         return []
 
     max_updates = max(0, pose_update_config.max_updates_per_frame)
     if max_updates == 0:
         return []
 
-    selected_observations = truth_observation_set.observations[:max_updates]
-    selected_landmarks = truth_observation_set.landmark_positions[:max_updates]
+    if pose_update_config.use_truth_observations:
+        if truth_observation_set is None:
+            return []
+        selected_observations = truth_observation_set.observations[:max_updates]
+        selected_landmarks = truth_observation_set.landmark_positions[:max_updates]
+    else:
+        if not association_result.matched:
+            return []
+        selected_matches = association_result.matched[:max_updates]
+        selected_observations = [feature_observations[match.observation_index] for match in selected_matches]
+        selected_landmarks = list(associated_track_positions[: len(selected_matches)])
+
     if not selected_observations:
         return []
 
@@ -841,6 +870,7 @@ def step_simulation(state: SimulationState):
     observed_landmark_points = measurements_to_world_points(observed_landmarks, observation_pose)
     feature_observations = build_feature_observations(observed_landmarks, observed_landmark_points)
     association_result = associate_feature_observations(state, feature_observations)
+    associated_track_positions = extract_associated_track_positions(slam_state.landmark_track_state, association_result)
     slam_state.persistent_landmarks = update_persistent_landmarks(
         observed_landmark_points,
         slam_state.persistent_landmarks,
@@ -894,8 +924,19 @@ def step_simulation(state: SimulationState):
     )
     pre_update_mu = slam_state.mu.copy()
     pre_update_sigma = slam_state.Sigma.copy()
-    pose_update_results = apply_pose_only_ekf_correction(state, truth_observation_set)
-    num_candidate_observations = len(truth_observation_set.observations) if truth_observation_set is not None else 0
+    pose_update_results = apply_pose_only_ekf_correction(
+        state,
+        truth_observation_set,
+        feature_observations,
+        association_result,
+        associated_track_positions,
+    )
+    if state.config.ekf.pose_update.use_truth_observations:
+        num_candidate_observations = len(truth_observation_set.observations) if truth_observation_set is not None else 0
+        num_rejections = 0
+    else:
+        num_candidate_observations = len(feature_observations)
+        num_rejections = len(association_result.rejected)
     ekf_diagnostics = build_ekf_step_diagnostics(
         pose_before_update=pre_update_mu,
         pose_after_update=slam_state.mu,
@@ -903,7 +944,7 @@ def step_simulation(state: SimulationState):
         sigma_after_update=slam_state.Sigma,
         update_results=pose_update_results,
         num_candidate_observations=num_candidate_observations,
-        num_rejections=0,
+        num_rejections=num_rejections,
     )
     ekf_debug_info = compute_ekf_debug_info(slam_state.Sigma)
 
