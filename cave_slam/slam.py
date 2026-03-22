@@ -28,6 +28,23 @@ class PersistentLandmark:
 
 
 @dataclass
+class LandmarkTrack:
+    track_id: int
+    position: np.ndarray
+    covariance: np.ndarray | None
+    observation_count: int
+    last_seen_frame: int
+    ttl: int
+    quality_score: float
+
+
+@dataclass
+class LandmarkTrackState:
+    tracks: dict[int, LandmarkTrack]
+    next_track_id: int = 0
+
+
+@dataclass
 class LidarScan:
     measurements: list[ScanMeasurement]
     scan_samples: list[ScanMeasurement]
@@ -570,6 +587,103 @@ def update_persistent_landmarks(
             best_match.ttl = feature_config.persistence_frames
 
     return updated_landmarks
+
+
+def initialize_landmark_track_state():
+    return LandmarkTrackState(tracks={})
+
+
+def _compute_track_quality(observation_count: int, staleness_frames: int, ttl: int):
+    confidence = min(1.0, observation_count / 5.0)
+    freshness = max(0.0, 1.0 - (staleness_frames / max(ttl, 1)))
+    return float(confidence * freshness)
+
+
+def create_landmark_track(point: np.ndarray, frame_index: int, feature_config: FeatureExtractionConfig, track_id: int):
+    ttl = feature_config.persistence_frames
+    covariance = np.eye(2, dtype=float) * (feature_config.association_radius ** 2)
+    return LandmarkTrack(
+        track_id=track_id,
+        position=np.array(point, dtype=float, copy=True),
+        covariance=covariance,
+        observation_count=1,
+        last_seen_frame=frame_index,
+        ttl=ttl,
+        quality_score=_compute_track_quality(1, 0, ttl),
+    )
+
+
+def update_landmark_track(
+    track: LandmarkTrack,
+    point: np.ndarray,
+    frame_index: int,
+    feature_config: FeatureExtractionConfig,
+):
+    previous_count = max(track.observation_count, 1)
+    blend = 1.0 / (previous_count + 1.0)
+    track.position = (1.0 - blend) * track.position + blend * np.asarray(point, dtype=float)
+    track.observation_count = previous_count + 1
+    track.last_seen_frame = frame_index
+    track.ttl = feature_config.persistence_frames
+    track.quality_score = _compute_track_quality(track.observation_count, 0, track.ttl)
+
+    if track.covariance is not None:
+        base_variance = feature_config.association_radius ** 2
+        confidence_scale = max(0.2, 1.0 / track.observation_count)
+        track.covariance = np.eye(2, dtype=float) * (base_variance * confidence_scale)
+
+    return track
+
+
+def prune_landmark_tracks(track_state: LandmarkTrackState, frame_index: int):
+    expired_track_ids: list[int] = []
+    for track_id, track in track_state.tracks.items():
+        staleness_frames = max(0, frame_index - track.last_seen_frame)
+        if staleness_frames > track.ttl:
+            expired_track_ids.append(track_id)
+            continue
+        track.quality_score = _compute_track_quality(track.observation_count, staleness_frames, track.ttl)
+
+    for track_id in expired_track_ids:
+        del track_state.tracks[track_id]
+
+    return track_state
+
+
+def update_landmark_track_state(
+    world_points: Sequence[np.ndarray],
+    track_state: LandmarkTrackState,
+    frame_index: int,
+    feature_config: FeatureExtractionConfig,
+):
+    prune_landmark_tracks(track_state, frame_index)
+    matched_track_ids: set[int] = set()
+
+    for point in world_points:
+        point_array = np.asarray(point, dtype=float)
+        best_track = None
+        best_distance = feature_config.association_radius
+
+        for track in track_state.tracks.values():
+            if track.track_id in matched_track_ids:
+                continue
+
+            distance = float(np.linalg.norm(point_array - track.position))
+            if distance <= best_distance:
+                best_distance = distance
+                best_track = track
+
+        if best_track is None:
+            track_id = track_state.next_track_id
+            track_state.tracks[track_id] = create_landmark_track(point_array, frame_index, feature_config, track_id)
+            track_state.next_track_id += 1
+            matched_track_ids.add(track_id)
+            continue
+
+        update_landmark_track(best_track, point_array, frame_index, feature_config)
+        matched_track_ids.add(best_track.track_id)
+
+    return track_state
 
 
 def get_voxel_key(point_x: float, point_y: float, voxel_size: float):

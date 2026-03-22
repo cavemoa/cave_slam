@@ -16,6 +16,7 @@ from .slam import (
     EkfStepDiagnostics,
     LidarScan,
     EkfUpdateResult,
+    LandmarkTrackState,
     PersistentLandmark,
     ScanMeasurement,
     TruthObservationSet,
@@ -27,10 +28,12 @@ from .slam import (
     ekf_update_pose_only_batch,
     extract_landmarks,
     extract_truth_landmark_positions,
+    initialize_landmark_track_state,
     measurements_to_world_points,
     simulate_lidar,
     simulate_landmark_observations_from_truth,
     transform_measurements,
+    update_landmark_track_state,
     update_persistent_landmarks,
     update_voxel_grid,
 )
@@ -310,6 +313,7 @@ class SlamState:
     voxel_points_y: list[float]
     voxel_state: dict
     persistent_landmarks: list[PersistentLandmark]
+    landmark_track_state: LandmarkTrackState
     true_trajectory_x: list[float]
     true_trajectory_y: list[float]
     ekf_trajectory_x: list[float]
@@ -322,6 +326,7 @@ class StepResult:
     observation_pose: np.ndarray
     lidar_scan: LidarScan
     observed_landmarks: list[ScanMeasurement]
+    landmark_track_count: int
     truth_observation_set: TruthObservationSet | None
     association_result: EkfAssociationSummary | None
     motion_command: MotionCommand
@@ -661,6 +666,7 @@ def initialize_slam_state(initial_pose: InitialPoseConfig):
         voxel_points_y=[],
         voxel_state=defaultdict(VoxelCellState),
         persistent_landmarks=[],
+        landmark_track_state=initialize_landmark_track_state(),
         true_trajectory_x=[initial_pose.x],
         true_trajectory_y=[initial_pose.y],
         ekf_trajectory_x=[initial_pose.x],
@@ -767,6 +773,12 @@ def step_simulation(state: SimulationState):
         slam_state.persistent_landmarks,
         state.config.feature_extraction,
     )
+    slam_state.landmark_track_state = update_landmark_track_state(
+        observed_landmark_points,
+        slam_state.landmark_track_state,
+        current_frame,
+        state.config.feature_extraction,
+    )
 
     mapped_x, mapped_y = transform_measurements(lidar_scan.measurements, slam_state.mu)
     slam_state.point_cloud_x.extend(mapped_x)
@@ -842,6 +854,7 @@ def step_simulation(state: SimulationState):
         observation_pose=observation_pose,
         lidar_scan=lidar_scan,
         observed_landmarks=observed_landmarks,
+        landmark_track_count=len(slam_state.landmark_track_state.tracks),
         truth_observation_set=truth_observation_set,
         association_result=association_result,
         motion_command=command,

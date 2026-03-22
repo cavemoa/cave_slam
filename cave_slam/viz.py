@@ -83,7 +83,10 @@ def _build_ekf_diagnostics_text(state: SimulationState):
 
     diagnostics = state.last_step_result.ekf_diagnostics
     debug_info = state.last_step_result.ekf_debug_info
+    track_count = state.last_step_result.landmark_track_count
     return (
+        f"Tracks={track_count}"
+        "\n"
         f"EKF diag | cand={diagnostics.num_candidate_observations}"
         f" match={diagnostics.num_matches}"
         f" rej={diagnostics.num_rejections}"
