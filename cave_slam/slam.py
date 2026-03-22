@@ -1,0 +1,309 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Sequence
+
+import numpy as np
+
+if TYPE_CHECKING:
+    from .sim import FeatureExtractionConfig, OdometryNoiseConfig, SensorConfig, VoxelGridConfig
+
+
+@dataclass(frozen=True)
+class WallSegment:
+    start: tuple[float, float]
+    end: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class ScanMeasurement:
+    angle: float
+    distance: float
+
+
+@dataclass
+class PersistentLandmark:
+    position: np.ndarray
+    ttl: int
+
+
+@dataclass
+class LidarScan:
+    measurements: list[ScanMeasurement]
+    scan_samples: list[ScanMeasurement]
+    min_dist_forward: float
+
+
+def cross2d(a, b):
+    return a[0] * b[1] - a[1] * b[0]
+
+
+def get_intersection(ray_origin, ray_dir, wall: WallSegment):
+    p = np.array(ray_origin, dtype=float)
+    d = np.array(ray_dir, dtype=float)
+    a = np.array(wall.start, dtype=float)
+    b = np.array(wall.end, dtype=float)
+
+    v1 = p - a
+    v2 = b - a
+    v3 = np.array([-d[1], d[0]], dtype=float)
+
+    dot = np.dot(v2, v3)
+    if abs(dot) < 1e-6:
+        return None, float("inf")
+
+    t1 = cross2d(v2, v1) / dot
+    t2 = np.dot(v1, v3) / dot
+
+    if t1 >= 0 and 0 <= t2 <= 1:
+        hit_point = p + t1 * d
+        return hit_point, t1
+
+    return None, float("inf")
+
+
+def apply_sensor_noise(distance: float, sensor_config: SensorConfig, rng):
+    noise_config = sensor_config.noise
+    if not noise_config.enabled:
+        return distance
+
+    distance_ratio = np.clip(distance / sensor_config.max_range, 0.0, 1.0)
+    relative_std = np.interp(
+        distance_ratio,
+        [0.0, 1.0],
+        [noise_config.min_relative_std, noise_config.max_relative_std],
+    )
+    noisy_distance = rng.normal(distance, distance * relative_std)
+    return float(np.clip(noisy_distance, 0.0, sensor_config.max_range))
+
+
+def simulate_lidar(
+    x: float,
+    y: float,
+    theta: float,
+    walls: Sequence[WallSegment],
+    sensor_config: SensorConfig,
+    rng,
+    forward_sector_rad: float = np.radians(10.0),
+):
+    angles = np.linspace(
+        -np.radians(sensor_config.fov_degrees / 2),
+        np.radians(sensor_config.fov_degrees / 2),
+        sensor_config.num_rays,
+    )
+    measurements: list[ScanMeasurement] = []
+    scan_samples: list[ScanMeasurement] = []
+    min_dist_forward = float("inf")
+
+    for angle in angles:
+        ray_theta = theta + angle
+        ray_dir = [np.cos(ray_theta), np.sin(ray_theta)]
+
+        min_dist = sensor_config.max_range
+        for wall in walls:
+            hit_point, dist = get_intersection((x, y), ray_dir, wall)
+            if hit_point is not None and dist < min_dist:
+                min_dist = dist
+
+        if min_dist < sensor_config.max_range:
+            noisy_dist = apply_sensor_noise(min_dist, sensor_config, rng)
+            measurement = ScanMeasurement(angle=float(angle), distance=noisy_dist)
+            measurements.append(measurement)
+            scan_samples.append(measurement)
+        else:
+            scan_samples.append(ScanMeasurement(angle=float(angle), distance=sensor_config.max_range))
+
+        if abs(angle) < forward_sector_rad:
+            min_dist_forward = min(min_dist_forward, min_dist)
+
+    return LidarScan(
+        measurements=measurements,
+        scan_samples=scan_samples,
+        min_dist_forward=float(min_dist_forward),
+    )
+
+
+def fit_line_direction(points):
+    points_array = np.asarray(points, dtype=float)
+    centroid = np.mean(points_array, axis=0)
+    centered = points_array - centroid
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    direction = vh[0]
+    return centroid, direction / np.linalg.norm(direction)
+
+
+def point_line_distance(point, line_point, line_direction):
+    offset = point - line_point
+    return abs(cross2d(offset, line_direction))
+
+
+def suppress_nearby_corners(candidates, nms_radius: int):
+    selected = []
+    blocked_indices = set()
+
+    for candidate in sorted(candidates, key=lambda item: item["score"], reverse=True):
+        index = candidate["index"]
+        if index in blocked_indices:
+            continue
+        selected.append(candidate)
+        blocked_indices.update(range(index - nms_radius, index + nms_radius + 1))
+
+    return sorted(selected, key=lambda item: item["index"])
+
+
+def extract_landmarks(measurements: Sequence[ScanMeasurement], config: FeatureExtractionConfig):
+    window_size = config.window_size
+    if len(measurements) < (2 * window_size + 1):
+        return []
+
+    local_points = [
+        np.array([measurement.distance * np.cos(measurement.angle), measurement.distance * np.sin(measurement.angle)], dtype=float)
+        for measurement in measurements
+    ]
+
+    candidates = []
+    for index in range(window_size, len(local_points) - window_size):
+        left_points = local_points[index - window_size:index]
+        right_points = local_points[index + 1:index + 1 + window_size]
+        candidate_point = local_points[index]
+
+        left_chain = left_points + [candidate_point]
+        right_chain = [candidate_point] + right_points
+        if any(np.linalg.norm(b - a) > config.max_neighbor_gap for a, b in zip(left_chain, left_chain[1:])):
+            continue
+        if any(np.linalg.norm(b - a) > config.max_neighbor_gap for a, b in zip(right_chain, right_chain[1:])):
+            continue
+
+        left_span = np.linalg.norm(left_points[-1] - left_points[0])
+        right_span = np.linalg.norm(right_points[-1] - right_points[0])
+        if left_span < config.min_segment_span or right_span < config.min_segment_span:
+            continue
+
+        left_center, left_direction = fit_line_direction(left_points)
+        right_center, right_direction = fit_line_direction(right_points)
+
+        line_alignment = np.clip(abs(np.dot(left_direction, right_direction)), 0.0, 1.0)
+        corner_angle_deg = np.degrees(np.arccos(line_alignment))
+        if not (config.min_corner_angle_deg <= corner_angle_deg <= config.max_corner_angle_deg):
+            continue
+
+        left_residual = point_line_distance(candidate_point, left_center, left_direction)
+        right_residual = point_line_distance(candidate_point, right_center, right_direction)
+        if left_residual > config.max_line_residual or right_residual > config.max_line_residual:
+            continue
+
+        candidates.append({"index": index, "score": corner_angle_deg})
+
+    filtered_candidates = suppress_nearby_corners(candidates, config.nms_radius)
+    return [measurements[candidate["index"]] for candidate in filtered_candidates]
+
+
+def transform_measurements(measurements: Sequence[ScanMeasurement], pose: np.ndarray):
+    points_x, points_y = [], []
+    for measurement in measurements:
+        world_theta = pose[2] + measurement.angle
+        points_x.append(pose[0] + measurement.distance * np.cos(world_theta))
+        points_y.append(pose[1] + measurement.distance * np.sin(world_theta))
+    return points_x, points_y
+
+
+def measurements_to_world_points(measurements: Sequence[ScanMeasurement], pose: np.ndarray):
+    world_points = []
+    for measurement in measurements:
+        world_theta = pose[2] + measurement.angle
+        world_points.append(
+            np.array(
+                [
+                    pose[0] + measurement.distance * np.cos(world_theta),
+                    pose[1] + measurement.distance * np.sin(world_theta),
+                ],
+                dtype=float,
+            )
+        )
+    return world_points
+
+
+def update_persistent_landmarks(
+    world_points: Sequence[np.ndarray],
+    persistent_landmarks: Sequence[PersistentLandmark],
+    feature_config: FeatureExtractionConfig,
+):
+    updated_landmarks: list[PersistentLandmark] = []
+    for landmark in persistent_landmarks:
+        remaining = landmark.ttl - 1
+        if remaining > 0:
+            updated_landmarks.append(PersistentLandmark(position=landmark.position, ttl=remaining))
+
+    for point in world_points:
+        best_match = None
+        best_distance = feature_config.association_radius
+        for landmark in updated_landmarks:
+            distance = np.linalg.norm(point - landmark.position)
+            if distance <= best_distance:
+                best_distance = distance
+                best_match = landmark
+
+        if best_match is None:
+            updated_landmarks.append(PersistentLandmark(position=point, ttl=feature_config.persistence_frames))
+        else:
+            best_match.position = 0.5 * (best_match.position + point)
+            best_match.ttl = feature_config.persistence_frames
+
+    return updated_landmarks
+
+
+def get_voxel_key(point_x: float, point_y: float, voxel_size: float):
+    return (int(point_x // voxel_size), int(point_y // voxel_size))
+
+
+def update_voxel_grid(points_x, points_y, voxel_state, voxel_config: VoxelGridConfig):
+    for point_x, point_y in zip(points_x, points_y):
+        voxel_key = get_voxel_key(point_x, point_y, voxel_config.voxel_size)
+        state = voxel_state[voxel_key]
+        state["sum_x"] += point_x
+        state["sum_y"] += point_y
+        state["count"] += 1
+
+    averaged_points_x, averaged_points_y = [], []
+    for state in voxel_state.values():
+        if state["count"] >= voxel_config.min_points_per_voxel:
+            averaged_points_x.append(state["sum_x"] / state["count"])
+            averaged_points_y.append(state["sum_y"] / state["count"])
+
+    return averaged_points_x, averaged_points_y
+
+
+def ekf_predict(mu, Sigma, measured_distance: float, measured_turn: float, noise_config: OdometryNoiseConfig):
+    x, y, theta = mu[0], mu[1], mu[2]
+
+    theta_new = theta + measured_turn
+    theta_new = (theta_new + np.pi) % (2 * np.pi) - np.pi
+
+    x_new = x + measured_distance * np.cos(theta_new)
+    y_new = y + measured_distance * np.sin(theta_new)
+
+    mu[0], mu[1], mu[2] = x_new, y_new, theta_new
+
+    state_size = len(mu)
+    G = np.eye(state_size)
+    G[0, 2] = -measured_distance * np.sin(theta_new)
+    G[1, 2] = measured_distance * np.cos(theta_new)
+
+    var_dist = noise_config.distance_std ** 2
+    var_turn = np.radians(noise_config.angle_std_deg) ** 2
+    q_control = np.array([[var_dist, 0], [0, var_turn]])
+
+    v = np.array(
+        [
+            [np.cos(theta_new), -measured_distance * np.sin(theta_new)],
+            [np.sin(theta_new), measured_distance * np.cos(theta_new)],
+            [0, 1],
+        ]
+    )
+
+    r_pose = v @ q_control @ v.T
+    r = np.zeros((state_size, state_size))
+    r[0:3, 0:3] = r_pose
+
+    Sigma = G @ Sigma @ G.T + r
+    return mu, Sigma

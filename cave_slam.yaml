@@ -1,0 +1,71 @@
+simulation:
+  delay_ms: 50
+  frames: 500
+  random_seed: 50
+
+environment:
+  generator:
+    enabled: true
+    complexity: 10      # Number of random obstacles to spawn
+    width: 15.0         # X boundary of the room
+    height: 15.0        # Y boundary of the room
+    overlap_boundaries: true # Allows random blocks to overlap wall to add feature complexity
+    min_area: 1.0     # Minimum polygon area in square units
+    max_area: 8.0     # Maximum polygon area in square units
+  # You can still provide manual walls here if generator.enabled is false
+  walls: []
+
+sensor:
+  fov_degrees: 30
+  num_rays: 8
+  max_range: 15.0
+  noise:
+    enabled: true
+    min_relative_std: 0.005
+    max_relative_std: 0.05
+
+feature_extraction:
+  window_size: 2
+  max_neighbor_gap: 1.0
+  min_segment_span: 0.2
+  max_line_residual: 0.12
+  min_corner_angle_deg: 45
+  max_corner_angle_deg: 135
+  nms_radius: 1
+  persistence_frames: 500
+  association_radius: 0.35
+
+motion:
+  linear_speed: 0.2
+  random_turn_deg: 5
+  collision_turn_deg: 15
+  collision_distance: 1.0
+
+odometry_noise:
+  distance_std: 0.01
+  angle_std_deg: 0.025
+
+voxel_grid:
+  voxel_size: 0.35
+  min_points_per_voxel: 3
+  point_size: 30
+  point_alpha: 0.9
+  color: darkorange
+
+agent:
+  initial_pose:
+    x: 2.0
+    y: 2.0
+    theta_deg: 45
+  startup_behavior:
+    enabled: true
+    mode: spin_in_place
+    rotation_degrees: 360
+    turn_step_deg: 15
+
+plot:
+  figsize: [8, 8]
+  xlim: [-1, 16]
+  ylim: [-1, 16]
+  point_size: 10
+  point_alpha: 0.08
