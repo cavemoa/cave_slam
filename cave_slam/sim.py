@@ -14,6 +14,7 @@ from .slam import (
     LidarScan,
     PersistentLandmark,
     ScanMeasurement,
+    VoxelCellState,
     WallSegment,
     ekf_predict,
     extract_landmarks,
@@ -87,6 +88,11 @@ DEFAULT_CONFIG = {
         "point_size": 30,
         "point_alpha": 0.9,
         "color": "darkorange",
+        "weighting_mode": "inverse_variance",
+        "distance_weight_power": 2.0,
+        "temporal_decay": 0.995,
+        "best_observation_override": True,
+        "best_observation_max_distance": 4.0,
     },
     "agent": {
         "initial_pose": {
@@ -188,6 +194,11 @@ class VoxelGridConfig:
     point_size: float
     point_alpha: float
     color: str
+    weighting_mode: str
+    distance_weight_power: float
+    temporal_decay: float
+    best_observation_override: bool
+    best_observation_max_distance: float
 
 
 @dataclass(frozen=True)
@@ -251,6 +262,7 @@ class SlamState:
 
 @dataclass
 class StepResult:
+    frame_index: int
     observation_pose: np.ndarray
     lidar_scan: LidarScan
     observed_landmarks: list[ScanMeasurement]
@@ -266,6 +278,7 @@ class SimulationState:
     walls: list[WallSegment]
     agent_state: AgentState
     slam_state: SlamState
+    step_index: int = 0
     artists: PlotArtists | None = None
     animation: object | None = None
 
@@ -314,6 +327,20 @@ def _require_str(value: Any, path: str):
     if not isinstance(value, str):
         raise TypeError(f"{path} must be a string")
     return value
+
+
+def _require_choice(value: Any, path: str, choices: Sequence[str]):
+    string_value = _require_str(value, path)
+    if string_value not in choices:
+        raise ValueError(f"{path} must be one of {', '.join(choices)}")
+    return string_value
+
+
+def _require_probability(value: Any, path: str):
+    probability = _require_float(value, path)
+    if not (0.0 < probability <= 1.0):
+        raise ValueError(f"{path} must be in the interval (0, 1]")
+    return probability
 
 
 def _require_pair(value: Any, path: str):
@@ -414,6 +441,11 @@ def parse_config(raw_config: Mapping[str, Any]):
             point_size=_require_float(voxel_grid["point_size"], "voxel_grid.point_size"),
             point_alpha=_require_float(voxel_grid["point_alpha"], "voxel_grid.point_alpha"),
             color=_require_str(voxel_grid["color"], "voxel_grid.color"),
+            weighting_mode=_require_choice(voxel_grid["weighting_mode"], "voxel_grid.weighting_mode", ("inverse_variance", "inverse_distance")),
+            distance_weight_power=_require_float(voxel_grid["distance_weight_power"], "voxel_grid.distance_weight_power"),
+            temporal_decay=_require_probability(voxel_grid["temporal_decay"], "voxel_grid.temporal_decay"),
+            best_observation_override=_require_bool(voxel_grid["best_observation_override"], "voxel_grid.best_observation_override"),
+            best_observation_max_distance=_require_float(voxel_grid["best_observation_max_distance"], "voxel_grid.best_observation_max_distance"),
         ),
         agent=AgentConfig(
             initial_pose=InitialPoseConfig(
@@ -542,7 +574,7 @@ def initialize_slam_state(initial_pose: InitialPoseConfig):
         point_cloud_y=[],
         voxel_points_x=[],
         voxel_points_y=[],
-        voxel_state=defaultdict(lambda: {"sum_x": 0.0, "sum_y": 0.0, "count": 0}),
+        voxel_state=defaultdict(VoxelCellState),
         persistent_landmarks=[],
         true_trajectory_x=[initial_pose.x],
         true_trajectory_y=[initial_pose.y],
@@ -581,6 +613,7 @@ def create_simulation(config: AppConfig | Mapping[str, Any]):
 
 
 def step_simulation(state: SimulationState):
+    current_frame = state.step_index + 1
     observation_pose = state.agent_state.true_pose.copy()
     forward_sector_rad = np.radians(state.config.motion.front_sector_deg)
     lidar_scan = simulate_lidar(
@@ -606,7 +639,15 @@ def step_simulation(state: SimulationState):
     slam_state.point_cloud_x.extend(mapped_x)
     slam_state.point_cloud_y.extend(mapped_y)
 
-    averaged_x, averaged_y = update_voxel_grid(mapped_x, mapped_y, slam_state.voxel_state, state.config.voxel_grid)
+    averaged_x, averaged_y = update_voxel_grid(
+        mapped_x,
+        mapped_y,
+        lidar_scan.measurements,
+        slam_state.voxel_state,
+        state.config.voxel_grid,
+        state.config.sensor,
+        current_frame,
+    )
     slam_state.voxel_points_x[:] = averaged_x
     slam_state.voxel_points_y[:] = averaged_y
 
@@ -638,8 +679,10 @@ def step_simulation(state: SimulationState):
     slam_state.true_trajectory_y.append(state.agent_state.true_pose[1])
     slam_state.ekf_trajectory_x.append(slam_state.mu[0])
     slam_state.ekf_trajectory_y.append(slam_state.mu[1])
+    state.step_index = current_frame
 
     return StepResult(
+        frame_index=current_frame,
         observation_pose=observation_pose,
         lidar_scan=lidar_scan,
         observed_landmarks=observed_landmarks,

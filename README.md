@@ -217,7 +217,30 @@ The simulation keeps two related map views:
 - raw accumulated point cloud
 - voxel-grid averaged points
 
-The voxel grid reduces visual clutter by averaging repeated returns that fall into the same spatial cell once a minimum point count is reached.
+The voxel grid reduces visual clutter by fusing repeated returns that fall into the same spatial cell once a minimum point count is reached.
+
+The current implementation is no longer a simple lifetime mean of all points in a cell. Each voxel now keeps weighted fusion state and updates over time as the robot revisits the same area.
+
+The current voxel fusion supports:
+
+- weighted updates, using either inverse-variance or inverse-distance weighting
+- temporal decay, so older observations gradually lose influence
+- optional best-observation override, so close confident hits can sharpen a voxel instead of being blurred by older long-range points
+
+In practice this means:
+
+- long-range early observations do not dominate forever
+- short-range observations can progressively refine the same cell
+- the displayed voxel point can either be the weighted fused centroid or, for close confident hits, a sharper best-observation position
+
+The two weighting modes behave as follows:
+
+- `inverse_variance`
+  - uses the lidar noise model, so measurements with lower estimated uncertainty get higher weight
+- `inverse_distance`
+  - uses a distance-based weight of `1 / distance^p`, where `p` is `distance_weight_power`
+
+Temporal decay is applied per frame, which makes the map more adaptable when the same area is observed again under better conditions.
 
 ### Motion and Obstacle Avoidance
 
@@ -424,6 +447,28 @@ The current repository YAML does not include every motion field. Missing values 
   - transparency of voxelized points
 - `color`
   - Matplotlib color name for voxel points
+- `weighting_mode`
+  - either `inverse_variance` or `inverse_distance`
+  - `inverse_variance` is usually the better default when sensor noise is enabled
+- `distance_weight_power`
+  - exponent used by inverse-distance weighting
+  - larger values make close observations dominate more strongly
+- `temporal_decay`
+  - per-frame decay applied to older voxel observations
+  - values closer to `1.0` retain history longer
+  - smaller values make the map adapt more quickly to new observations
+- `best_observation_override`
+  - whether close confident hits can override the displayed voxel centroid
+- `best_observation_max_distance`
+  - maximum range at which a hit is eligible to become a voxel's best observation
+
+Recommended tuning guidance:
+
+- use `inverse_variance` if you want the voxel map to track the lidar noise model
+- use `inverse_distance` if you want a simpler and more aggressive preference for nearby hits
+- lower `min_points_per_voxel` if you want voxels to appear earlier in a run
+- lower `temporal_decay` if you want the map to refine more quickly after the robot moves closer to a surface
+- reduce `best_observation_max_distance` if the override is too eager
 
 ### `agent.initial_pose`
 

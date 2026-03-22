@@ -34,6 +34,19 @@ class LidarScan:
     min_dist_forward: float
 
 
+@dataclass
+class VoxelCellState:
+    sum_w: float = 0.0
+    sum_wx: float = 0.0
+    sum_wy: float = 0.0
+    count: float = 0.0
+    best_x: float = 0.0
+    best_y: float = 0.0
+    best_weight: float = 0.0
+    best_distance: float = float("inf")
+    last_frame: int = 0
+
+
 def cross2d(a, b):
     return a[0] * b[1] - a[1] * b[0]
 
@@ -256,19 +269,88 @@ def get_voxel_key(point_x: float, point_y: float, voxel_size: float):
     return (int(point_x // voxel_size), int(point_y // voxel_size))
 
 
-def update_voxel_grid(points_x, points_y, voxel_state, voxel_config: VoxelGridConfig):
-    for point_x, point_y in zip(points_x, points_y):
+def _range_relative_std(distance: float, sensor_config: SensorConfig):
+    noise_config = sensor_config.noise
+    distance_ratio = np.clip(distance / sensor_config.max_range, 0.0, 1.0)
+    return float(
+        np.interp(
+            distance_ratio,
+            [0.0, 1.0],
+            [noise_config.min_relative_std, noise_config.max_relative_std],
+        )
+    )
+
+
+def _measurement_weight(distance: float, sensor_config: SensorConfig, voxel_config: VoxelGridConfig):
+    epsilon = 1e-6
+    if voxel_config.weighting_mode == "inverse_variance" and sensor_config.noise.enabled:
+        sigma = max(distance * _range_relative_std(distance, sensor_config), epsilon)
+        return 1.0 / (sigma ** 2)
+
+    safe_distance = max(distance, epsilon)
+    return 1.0 / (safe_distance ** voxel_config.distance_weight_power)
+
+
+def _advance_voxel_state(state: VoxelCellState, frame_index: int, voxel_config: VoxelGridConfig):
+    if frame_index <= state.last_frame:
+        return
+
+    decay_factor = voxel_config.temporal_decay ** (frame_index - state.last_frame)
+    state.sum_w *= decay_factor
+    state.sum_wx *= decay_factor
+    state.sum_wy *= decay_factor
+    state.count *= decay_factor
+    state.best_weight *= decay_factor
+    state.last_frame = frame_index
+
+    if state.best_weight < 1e-12:
+        state.best_distance = float("inf")
+
+
+def update_voxel_grid(
+    points_x,
+    points_y,
+    measurements: Sequence[ScanMeasurement],
+    voxel_state,
+    voxel_config: VoxelGridConfig,
+    sensor_config: SensorConfig,
+    frame_index: int,
+):
+    for point_x, point_y, measurement in zip(points_x, points_y, measurements):
         voxel_key = get_voxel_key(point_x, point_y, voxel_config.voxel_size)
         state = voxel_state[voxel_key]
-        state["sum_x"] += point_x
-        state["sum_y"] += point_y
-        state["count"] += 1
+        _advance_voxel_state(state, frame_index, voxel_config)
+
+        weight = _measurement_weight(measurement.distance, sensor_config, voxel_config)
+        state.sum_w += weight
+        state.sum_wx += weight * point_x
+        state.sum_wy += weight * point_y
+        state.count += 1.0
+
+        if (
+            voxel_config.best_observation_override
+            and measurement.distance <= voxel_config.best_observation_max_distance
+            and weight >= state.best_weight
+        ):
+            state.best_x = point_x
+            state.best_y = point_y
+            state.best_weight = weight
+            state.best_distance = measurement.distance
 
     averaged_points_x, averaged_points_y = [], []
     for state in voxel_state.values():
-        if state["count"] >= voxel_config.min_points_per_voxel:
-            averaged_points_x.append(state["sum_x"] / state["count"])
-            averaged_points_y.append(state["sum_y"] / state["count"])
+        _advance_voxel_state(state, frame_index, voxel_config)
+        if state.count >= voxel_config.min_points_per_voxel and state.sum_w > 1e-12:
+            if (
+                voxel_config.best_observation_override
+                and state.best_weight > 1e-12
+                and state.best_distance <= voxel_config.best_observation_max_distance
+            ):
+                averaged_points_x.append(state.best_x)
+                averaged_points_y.append(state.best_y)
+            else:
+                averaged_points_x.append(state.sum_wx / state.sum_w)
+                averaged_points_y.append(state.sum_wy / state.sum_w)
 
     return averaged_points_x, averaged_points_y
 
