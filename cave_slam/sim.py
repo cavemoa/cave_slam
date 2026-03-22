@@ -11,17 +11,20 @@ import yaml
 
 from .agent import AgentState, MotionCommand, initialize_agent_state, step_agent
 from .slam import (
-    EkfAssociationSummary,
+    AssociationResult,
     EkfDebugInfo,
     EkfStepDiagnostics,
     LidarScan,
     EkfUpdateResult,
     LandmarkTrackState,
+    LandmarkObservation,
     PersistentLandmark,
     ScanMeasurement,
     TruthObservationSet,
     VoxelCellState,
     WallSegment,
+    associate_landmarks_mahalanobis,
+    associate_landmarks_nearest_neighbor,
     build_ekf_step_diagnostics,
     compute_ekf_debug_info,
     ekf_predict,
@@ -142,6 +145,12 @@ DEFAULT_CONFIG = {
             "enabled": False,
             "use_truth_observations": True,
             "max_updates_per_frame": 8,
+        },
+        "association": {
+            "method": "mahalanobis",
+            "max_distance": 0.75,
+            "mahalanobis_threshold": 5.991,
+            "min_track_quality": 0.1,
         },
     },
 }
@@ -283,10 +292,19 @@ class PoseUpdateConfig:
 
 
 @dataclass(frozen=True)
+class AssociationConfig:
+    method: str
+    max_distance: float
+    mahalanobis_threshold: float
+    min_track_quality: float
+
+
+@dataclass(frozen=True)
 class EkfConfig:
     measurement: MeasurementModelConfig
     truth_update: TruthUpdateConfig
     pose_update: PoseUpdateConfig
+    association: AssociationConfig
 
 
 @dataclass(frozen=True)
@@ -328,7 +346,7 @@ class StepResult:
     observed_landmarks: list[ScanMeasurement]
     landmark_track_count: int
     truth_observation_set: TruthObservationSet | None
-    association_result: EkfAssociationSummary | None
+    association_result: AssociationResult
     motion_command: MotionCommand
     measured_distance: float
     measured_turn: float
@@ -450,6 +468,7 @@ def parse_config(raw_config: Mapping[str, Any]):
     ekf_measurement = _require_mapping(ekf["measurement"], "ekf.measurement")
     ekf_truth_update = _require_mapping(ekf["truth_update"], "ekf.truth_update")
     ekf_pose_update = _require_mapping(ekf["pose_update"], "ekf.pose_update")
+    ekf_association = _require_mapping(ekf["association"], "ekf.association")
 
     walls_raw = environment.get("walls", [])
     if not isinstance(walls_raw, Sequence) or isinstance(walls_raw, (str, bytes)):
@@ -555,6 +574,15 @@ def parse_config(raw_config: Mapping[str, Any]):
                 enabled=_require_bool(ekf_pose_update["enabled"], "ekf.pose_update.enabled"),
                 use_truth_observations=_require_bool(ekf_pose_update["use_truth_observations"], "ekf.pose_update.use_truth_observations"),
                 max_updates_per_frame=_require_int(ekf_pose_update["max_updates_per_frame"], "ekf.pose_update.max_updates_per_frame"),
+            ),
+            association=AssociationConfig(
+                method=_require_choice(ekf_association["method"], "ekf.association.method", ("nearest_neighbor", "mahalanobis")),
+                max_distance=_require_float(ekf_association["max_distance"], "ekf.association.max_distance"),
+                mahalanobis_threshold=_require_float(
+                    ekf_association["mahalanobis_threshold"],
+                    "ekf.association.mahalanobis_threshold",
+                ),
+                min_track_quality=_require_float(ekf_association["min_track_quality"], "ekf.association.min_track_quality"),
             ),
         ),
     )
@@ -724,6 +752,49 @@ def build_truth_observations(state: SimulationState, observation_pose: np.ndarra
     )
 
 
+def build_feature_observations(
+    observed_landmarks: Sequence[ScanMeasurement],
+    observed_landmark_points: Sequence[np.ndarray],
+):
+    observations: list[LandmarkObservation] = []
+    for index, (measurement, world_point) in enumerate(zip(observed_landmarks, observed_landmark_points)):
+        observations.append(
+            LandmarkObservation(
+                range=float(measurement.distance),
+                bearing=float(measurement.angle),
+                world_position=np.array(world_point, dtype=float, copy=True),
+                source_id=index,
+            )
+        )
+    return observations
+
+
+def associate_feature_observations(
+    state: SimulationState,
+    feature_observations: Sequence[LandmarkObservation],
+):
+    association_config = state.config.ekf.association
+    track_state = state.slam_state.landmark_track_state
+    if association_config.method == "nearest_neighbor":
+        return associate_landmarks_nearest_neighbor(
+            feature_observations,
+            track_state,
+            max_distance=association_config.max_distance,
+            min_track_quality=association_config.min_track_quality,
+        )
+
+    return associate_landmarks_mahalanobis(
+        feature_observations,
+        track_state,
+        state.slam_state.mu,
+        state.slam_state.Sigma,
+        state.config.ekf.measurement,
+        max_distance=association_config.max_distance,
+        mahalanobis_threshold=association_config.mahalanobis_threshold,
+        min_track_quality=association_config.min_track_quality,
+    )
+
+
 def apply_pose_only_ekf_correction(state: SimulationState, truth_observation_set: TruthObservationSet | None):
     pose_update_config = state.config.ekf.pose_update
     if not pose_update_config.enabled or not pose_update_config.use_truth_observations or truth_observation_set is None:
@@ -768,6 +839,8 @@ def step_simulation(state: SimulationState):
     slam_state = state.slam_state
     observed_landmarks = extract_landmarks(lidar_scan.measurements, state.config.feature_extraction)
     observed_landmark_points = measurements_to_world_points(observed_landmarks, observation_pose)
+    feature_observations = build_feature_observations(observed_landmarks, observed_landmark_points)
+    association_result = associate_feature_observations(state, feature_observations)
     slam_state.persistent_landmarks = update_persistent_landmarks(
         observed_landmark_points,
         slam_state.persistent_landmarks,
@@ -823,15 +896,6 @@ def step_simulation(state: SimulationState):
     pre_update_sigma = slam_state.Sigma.copy()
     pose_update_results = apply_pose_only_ekf_correction(state, truth_observation_set)
     num_candidate_observations = len(truth_observation_set.observations) if truth_observation_set is not None else 0
-    association_result = None
-    if truth_observation_set is not None and state.config.ekf.pose_update.use_truth_observations:
-        association_result = EkfAssociationSummary(
-            num_candidate_observations=num_candidate_observations,
-            num_matches=len(pose_update_results),
-            num_rejections=0,
-            source="truth_harness",
-            gating_applied=False,
-        )
     ekf_diagnostics = build_ekf_step_diagnostics(
         pose_before_update=pre_update_mu,
         pose_after_update=slam_state.mu,

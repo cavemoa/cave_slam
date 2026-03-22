@@ -68,6 +68,33 @@ class LandmarkObservation:
 
 
 @dataclass(frozen=True)
+class AssociationCandidate:
+    observation_index: int
+    track_id: int
+    innovation: np.ndarray
+    distance: float
+    mahalanobis_distance: float
+
+
+@dataclass(frozen=True)
+class AssociationMatch:
+    observation_index: int
+    track_id: int
+    innovation: np.ndarray
+    distance: float
+    mahalanobis_distance: float
+
+
+@dataclass(frozen=True)
+class AssociationResult:
+    matched: tuple[AssociationMatch, ...]
+    unmatched_observations: tuple[int, ...]
+    rejected: tuple[AssociationCandidate, ...]
+    method: str
+    gating_applied: bool
+
+
+@dataclass(frozen=True)
 class TruthObservationSet:
     observations: list[LandmarkObservation]
     landmark_positions: list[np.ndarray]
@@ -249,6 +276,157 @@ def innovation_range_bearing(z: np.ndarray, z_hat: np.ndarray):
 
 def observation_to_measurement_vector(observation: LandmarkObservation):
     return np.array([observation.range, observation.bearing], dtype=float)
+
+
+def compute_mahalanobis_distance(innovation: np.ndarray, innovation_covariance: np.ndarray):
+    innovation_covariance = symmetrize_covariance(np.asarray(innovation_covariance, dtype=float))
+    inverse_covariance = np.linalg.inv(innovation_covariance)
+    innovation_vector = np.asarray(innovation, dtype=float)
+    return float(innovation_vector.T @ inverse_covariance @ innovation_vector)
+
+
+def _candidate_distance(observation: LandmarkObservation, track: LandmarkTrack):
+    if observation.world_position is None:
+        return float("inf")
+    return float(np.linalg.norm(np.asarray(observation.world_position, dtype=float) - track.position))
+
+
+def _build_empty_association_result(method: str, gating_applied: bool):
+    return AssociationResult(
+        matched=(),
+        unmatched_observations=(),
+        rejected=(),
+        method=method,
+        gating_applied=gating_applied,
+    )
+
+
+def associate_landmarks_nearest_neighbor(
+    observations: Sequence[LandmarkObservation],
+    track_state: LandmarkTrackState,
+    max_distance: float,
+    min_track_quality: float,
+):
+    if not observations:
+        return _build_empty_association_result(method="nearest_neighbor", gating_applied=False)
+
+    unmatched_observations: list[int] = []
+    matched: list[AssociationMatch] = []
+    rejected: list[AssociationCandidate] = []
+    used_track_ids: set[int] = set()
+
+    for observation_index, observation in enumerate(observations):
+        best_track = None
+        best_distance = max_distance
+
+        for track in track_state.tracks.values():
+            if track.track_id in used_track_ids or track.quality_score < min_track_quality:
+                continue
+            if observation.world_position is None:
+                continue
+
+            distance = _candidate_distance(observation, track)
+            if distance <= best_distance:
+                best_distance = distance
+                best_track = track
+
+        if best_track is None:
+            unmatched_observations.append(observation_index)
+            continue
+
+        innovation = np.zeros(2, dtype=float)
+        match = AssociationMatch(
+            observation_index=observation_index,
+            track_id=best_track.track_id,
+            innovation=innovation,
+            distance=best_distance,
+            mahalanobis_distance=0.0,
+        )
+        matched.append(match)
+        used_track_ids.add(best_track.track_id)
+
+    return AssociationResult(
+        matched=tuple(matched),
+        unmatched_observations=tuple(unmatched_observations),
+        rejected=tuple(rejected),
+        method="nearest_neighbor",
+        gating_applied=False,
+    )
+
+
+def associate_landmarks_mahalanobis(
+    observations: Sequence[LandmarkObservation],
+    track_state: LandmarkTrackState,
+    mu: np.ndarray,
+    Sigma: np.ndarray,
+    measurement_config: MeasurementModelConfig,
+    max_distance: float,
+    mahalanobis_threshold: float,
+    min_track_quality: float,
+):
+    if not observations:
+        return _build_empty_association_result(method="mahalanobis", gating_applied=True)
+
+    unmatched_observations: list[int] = []
+    matched: list[AssociationMatch] = []
+    rejected: list[AssociationCandidate] = []
+    used_track_ids: set[int] = set()
+
+    for observation_index, observation in enumerate(observations):
+        z = observation_to_measurement_vector(observation)
+        best_candidate: AssociationCandidate | None = None
+
+        for track in track_state.tracks.values():
+            if track.track_id in used_track_ids or track.quality_score < min_track_quality:
+                continue
+
+            candidate_distance = _candidate_distance(observation, track)
+            if np.isfinite(candidate_distance) and candidate_distance > max_distance:
+                continue
+
+            z_hat = predict_range_bearing(mu, track.position)
+            innovation = innovation_range_bearing(z, z_hat)
+            H = range_bearing_jacobian_pose(mu, track.position)
+            R = measurement_noise_matrix(measurement_config)
+            innovation_covariance = H @ Sigma @ H.T + R
+            mahalanobis_distance = compute_mahalanobis_distance(innovation, innovation_covariance)
+
+            candidate = AssociationCandidate(
+                observation_index=observation_index,
+                track_id=track.track_id,
+                innovation=innovation,
+                distance=candidate_distance,
+                mahalanobis_distance=mahalanobis_distance,
+            )
+            if best_candidate is None or candidate.mahalanobis_distance < best_candidate.mahalanobis_distance:
+                best_candidate = candidate
+
+        if best_candidate is None:
+            unmatched_observations.append(observation_index)
+            continue
+
+        if best_candidate.mahalanobis_distance <= mahalanobis_threshold:
+            matched.append(
+                AssociationMatch(
+                    observation_index=best_candidate.observation_index,
+                    track_id=best_candidate.track_id,
+                    innovation=np.array(best_candidate.innovation, dtype=float, copy=True),
+                    distance=best_candidate.distance,
+                    mahalanobis_distance=best_candidate.mahalanobis_distance,
+                )
+            )
+            used_track_ids.add(best_candidate.track_id)
+        else:
+            rejected.append(best_candidate)
+            unmatched_observations.append(observation_index)
+
+    return AssociationResult(
+        matched=tuple(matched),
+        unmatched_observations=tuple(unmatched_observations),
+        rejected=tuple(rejected),
+        method="mahalanobis",
+        gating_applied=True,
+    )
 
 
 def joseph_covariance_update(Sigma: np.ndarray, K: np.ndarray, H: np.ndarray, R: np.ndarray):
