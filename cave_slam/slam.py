@@ -34,6 +34,14 @@ class LidarScan:
     min_dist_forward: float
 
 
+@dataclass(frozen=True)
+class EkfDebugInfo:
+    trace_sigma: float
+    pose_std_x: float
+    pose_std_y: float
+    pose_std_theta: float
+
+
 @dataclass
 class VoxelCellState:
     sum_w: float = 0.0
@@ -49,6 +57,38 @@ class VoxelCellState:
 
 def cross2d(a, b):
     return a[0] * b[1] - a[1] * b[0]
+
+
+def normalize_angle(angle: float):
+    return float((angle + np.pi) % (2 * np.pi) - np.pi)
+
+
+def normalize_state_angle(mu: np.ndarray):
+    mu[2] = normalize_angle(mu[2])
+    return mu
+
+
+def symmetrize_covariance(Sigma: np.ndarray):
+    return 0.5 * (Sigma + Sigma.T)
+
+
+def ensure_positive_semidefinite(Sigma: np.ndarray, min_eigenvalue: float = 1e-9):
+    Sigma = symmetrize_covariance(Sigma)
+    eigenvalues, eigenvectors = np.linalg.eigh(Sigma)
+    clipped_eigenvalues = np.maximum(eigenvalues, min_eigenvalue)
+    Sigma_psd = eigenvectors @ np.diag(clipped_eigenvalues) @ eigenvectors.T
+    return symmetrize_covariance(Sigma_psd)
+
+
+def compute_ekf_debug_info(Sigma: np.ndarray):
+    pose_covariance = symmetrize_covariance(Sigma[:3, :3])
+    diagonal = np.clip(np.diag(pose_covariance), 0.0, None)
+    return EkfDebugInfo(
+        trace_sigma=float(np.trace(pose_covariance)),
+        pose_std_x=float(np.sqrt(diagonal[0])),
+        pose_std_y=float(np.sqrt(diagonal[1])),
+        pose_std_theta=float(np.sqrt(diagonal[2])),
+    )
 
 
 def get_intersection(ray_origin, ray_dir, wall: WallSegment):
@@ -358,13 +398,13 @@ def update_voxel_grid(
 def ekf_predict(mu, Sigma, measured_distance: float, measured_turn: float, noise_config: OdometryNoiseConfig):
     x, y, theta = mu[0], mu[1], mu[2]
 
-    theta_new = theta + measured_turn
-    theta_new = (theta_new + np.pi) % (2 * np.pi) - np.pi
+    theta_new = normalize_angle(theta + measured_turn)
 
     x_new = x + measured_distance * np.cos(theta_new)
     y_new = y + measured_distance * np.sin(theta_new)
 
     mu[0], mu[1], mu[2] = x_new, y_new, theta_new
+    mu = normalize_state_angle(mu)
 
     state_size = len(mu)
     G = np.eye(state_size)
@@ -388,4 +428,6 @@ def ekf_predict(mu, Sigma, measured_distance: float, measured_turn: float, noise
     r[0:3, 0:3] = r_pose
 
     Sigma = G @ Sigma @ G.T + r
+    Sigma = symmetrize_covariance(Sigma)
+    Sigma = ensure_positive_semidefinite(Sigma)
     return mu, Sigma

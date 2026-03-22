@@ -11,11 +11,13 @@ import yaml
 
 from .agent import AgentState, MotionCommand, initialize_agent_state, step_agent
 from .slam import (
+    EkfDebugInfo,
     LidarScan,
     PersistentLandmark,
     ScanMeasurement,
     VoxelCellState,
     WallSegment,
+    compute_ekf_debug_info,
     ekf_predict,
     extract_landmarks,
     measurements_to_world_points,
@@ -269,6 +271,7 @@ class StepResult:
     motion_command: MotionCommand
     measured_distance: float
     measured_turn: float
+    ekf_debug_info: EkfDebugInfo
 
 
 @dataclass
@@ -675,6 +678,7 @@ def step_simulation(state: SimulationState):
         measured_turn,
         state.config.odometry_noise,
     )
+    ekf_debug_info = compute_ekf_debug_info(slam_state.Sigma)
 
     slam_state.true_trajectory_x.append(state.agent_state.true_pose[0])
     slam_state.true_trajectory_y.append(state.agent_state.true_pose[1])
@@ -690,4 +694,5 @@ def step_simulation(state: SimulationState):
         motion_command=command,
         measured_distance=measured_distance,
         measured_turn=measured_turn,
+        ekf_debug_info=ekf_debug_info,
     )
