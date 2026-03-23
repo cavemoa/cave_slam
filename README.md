@@ -555,6 +555,13 @@ Recommended tuning guidance:
   - raw point cloud transparency
 - `show_ekf_overlay`
   - show or hide the live EKF diagnostics text overlay during the simulation
+- `show_landmark_tracks`
+  - show or hide the landmark-track overlay
+- `track_color_mode`
+  - how landmark tracks are colored
+  - `quality` colors by track confidence
+  - `age` colors by frames since last seen
+  - `augmented` highlights tracks that are already in the EKF state
 
 ### `ekf`
 
@@ -639,6 +646,8 @@ The visualization currently shows:
 - blue points for the raw accumulated point cloud
 - orange points for the voxel-grid map
 - red outlined circles for detected persistent landmarks
+- colored points for landmark tracks
+  - color can represent track quality, age, or whether the track has been augmented into the EKF state
 - a dashed green line for the true trajectory
 - a magenta line for the EKF predicted trajectory
 - a red marker and heading for the true pose

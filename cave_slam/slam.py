@@ -1065,6 +1065,29 @@ def _compute_track_quality(observation_count: int, staleness_frames: int, ttl: i
     return float(confidence * freshness)
 
 
+def track_age_frames(track: LandmarkTrack, frame_index: int):
+    return max(0, int(frame_index - track.last_seen_frame))
+
+
+def track_is_augmented(track_id: int, state_index: EkfSlamStateIndex):
+    return get_landmark_state_index(state_index, track_id) is not None
+
+
+def track_display_value(
+    track: LandmarkTrack,
+    mode: str,
+    frame_index: int,
+    state_index: EkfSlamStateIndex,
+):
+    if mode == "quality":
+        return float(track.quality_score)
+    if mode == "age":
+        return float(track_age_frames(track, frame_index))
+    if mode == "augmented":
+        return 1.0 if track_is_augmented(track.track_id, state_index) else 0.0
+    raise ValueError(f"Unsupported track display mode: {mode}")
+
+
 def is_track_ready_for_augmentation(track: LandmarkTrack, augmentation_config: AugmentationConfig):
     return (
         track.observation_count >= augmentation_config.min_observations

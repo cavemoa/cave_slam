@@ -70,6 +70,8 @@ plot:
   point_size: 10
   point_alpha: 0.08
   show_ekf_overlay: false   # Show or hide the live EKF diagnostics text overlay
+  show_landmark_tracks: true   # Show or hide the landmark-track overlay
+  track_color_mode: quality   # Track coloring: quality, age, or augmented
 
 ekf:
   mode: full_slam   # Use pose_only or full_slam to enable EKF state augmentation with landmarks

@@ -1,3 +1,5 @@
 /.venv
 /__pycache__
 /old_scripts
+/cave_slam/cave_slam/__pycache__
+.pyc

@@ -7,6 +7,7 @@ from typing import Mapping
 
 import numpy as np
 
+from .slam import track_display_value
 from .sim import AppConfig, SimulationState, create_simulation, step_simulation
 
 
@@ -17,6 +18,7 @@ class PlotArtists:
     scatter_cloud: object
     voxel_scatter: object
     landmark_scatter: object
+    track_scatter: object
     true_traj_line: object
     ekf_traj_line: object
     true_marker: object
@@ -110,6 +112,41 @@ def _build_ekf_diagnostics_text(state: SimulationState):
     )
 
 
+def _track_colors(state: SimulationState):
+    import matplotlib.pyplot as plt
+
+    tracks = list(state.slam_state.landmark_track_state.tracks.values())
+    if not tracks:
+        return np.empty((0, 4))
+
+    mode = state.config.plot.track_color_mode
+    if mode == "augmented":
+        return np.array(
+            [
+                (0.0, 0.6, 0.2, 0.95) if track_display_value(track, mode, state.step_index, state.slam_state.ekf_slam_index) > 0.5
+                else (0.45, 0.45, 0.45, 0.55)
+                for track in tracks
+            ],
+            dtype=float,
+        )
+
+    values = np.array(
+        [
+            track_display_value(track, mode, state.step_index, state.slam_state.ekf_slam_index)
+            for track in tracks
+        ],
+        dtype=float,
+    )
+    if mode == "quality":
+        normalized = np.clip(values, 0.0, 1.0)
+        cmap = plt.get_cmap("viridis")
+    else:
+        max_value = max(float(np.max(values)), 1.0)
+        normalized = np.clip(values / max_value, 0.0, 1.0)
+        cmap = plt.get_cmap("plasma_r")
+    return np.asarray(cmap(normalized), dtype=float)
+
+
 def create_plot(state: SimulationState):
     _, plt = import_matplotlib_modules()
     fig, ax = plt.subplots(figsize=state.config.plot.figsize)
@@ -126,6 +163,8 @@ def create_plot(state: SimulationState):
     scatter_cloud = ax.scatter([], [], s=state.config.plot.point_size, c="blue", alpha=state.config.plot.point_alpha, label="Raw Point Cloud")
     voxel_scatter = ax.scatter([], [], s=state.config.voxel_grid.point_size, c=state.config.voxel_grid.color, alpha=state.config.voxel_grid.point_alpha, label="Voxel Grid")
     landmark_scatter = ax.scatter([], [], s=80, facecolors="none", edgecolors="red", linewidths=2, label="Detected Landmarks")
+    track_scatter = ax.scatter([], [], s=40, linewidths=0.5, edgecolors="black", alpha=0.95, label="Landmark Tracks")
+    track_scatter.set_visible(state.config.plot.show_landmark_tracks)
 
     true_traj_line, = ax.plot([], [], "g--", alpha=0.8, label="True Trajectory")
     ekf_traj_line, = ax.plot([], [], "m-", alpha=0.7, label="EKF Trajectory")
@@ -156,6 +195,7 @@ def create_plot(state: SimulationState):
         scatter_cloud=scatter_cloud,
         voxel_scatter=voxel_scatter,
         landmark_scatter=landmark_scatter,
+        track_scatter=track_scatter,
         true_traj_line=true_traj_line,
         ekf_traj_line=ekf_traj_line,
         true_marker=true_marker,
@@ -200,6 +240,19 @@ def render_simulation(state: SimulationState):
         artists.landmark_scatter.set_edgecolors(np.empty((0, 4)))
         artists.landmark_scatter.set_facecolors(np.empty((0, 4)))
 
+    if state.config.plot.show_landmark_tracks:
+        track_positions = np.array(
+            [track.position for track in slam_state.landmark_track_state.tracks.values()],
+            dtype=float,
+        )
+        artists.track_scatter.set_offsets(track_positions if len(track_positions) else np.empty((0, 2)))
+        artists.track_scatter.set_facecolors(_track_colors(state))
+        artists.track_scatter.set_visible(True)
+    else:
+        artists.track_scatter.set_offsets(np.empty((0, 2)))
+        artists.track_scatter.set_facecolors(np.empty((0, 4)))
+        artists.track_scatter.set_visible(False)
+
     artists.true_traj_line.set_data(slam_state.true_trajectory_x, slam_state.true_trajectory_y)
     artists.ekf_traj_line.set_data(slam_state.ekf_trajectory_x, slam_state.ekf_trajectory_y)
     artists.true_marker.set_data([agent_state.true_pose[0]], [agent_state.true_pose[1]])
@@ -223,6 +276,7 @@ def render_simulation(state: SimulationState):
         artists.scatter_cloud,
         artists.voxel_scatter,
         artists.landmark_scatter,
+        artists.track_scatter,
         artists.true_traj_line,
         artists.ekf_traj_line,
         artists.true_marker,

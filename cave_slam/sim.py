@@ -135,6 +135,8 @@ DEFAULT_CONFIG = {
         "point_size": 10,
         "point_alpha": 0.08,
         "show_ekf_overlay": True,
+        "show_landmark_tracks": True,
+        "track_color_mode": "quality",
     },
     "ekf": {
         "mode": "pose_only",
@@ -283,6 +285,8 @@ class PlotConfig:
     point_size: float
     point_alpha: float
     show_ekf_overlay: bool
+    show_landmark_tracks: bool
+    track_color_mode: str
 
 
 @dataclass(frozen=True)
@@ -588,6 +592,8 @@ def parse_config(raw_config: Mapping[str, Any]):
             point_size=_require_float(plot["point_size"], "plot.point_size"),
             point_alpha=_require_float(plot["point_alpha"], "plot.point_alpha"),
             show_ekf_overlay=_require_bool(plot["show_ekf_overlay"], "plot.show_ekf_overlay"),
+            show_landmark_tracks=_require_bool(plot["show_landmark_tracks"], "plot.show_landmark_tracks"),
+            track_color_mode=_require_choice(plot["track_color_mode"], "plot.track_color_mode", ("quality", "age", "augmented")),
         ),
         ekf=EkfConfig(
             mode=_require_choice(ekf["mode"], "ekf.mode", ("pose_only", "full_slam")),
