@@ -180,15 +180,17 @@ At a high level, each animation frame follows this loop:
 3. Corner-like landmarks are extracted from the scan.
 4. Feature observations are associated to the landmark track layer.
 5. The landmark track layer is updated and may create new landmark tracks.
-6. Measurements are transformed into world coordinates using the current EKF pose.
-7. The point cloud is accumulated and averaged into a voxel grid.
-8. The agent controller chooses a motion command.
-9. Odometry noise is added to the command.
-10. The EKF prediction step updates the estimated pose.
-11. Depending on `ekf.mode`, the estimator performs either pose-only correction or full EKF-SLAM landmark augmentation and update.
+6. Depending on `ekf.mode`, the estimator performs either pose-only correction or full EKF-SLAM landmark augmentation and update.
+7. Measurements are transformed into world coordinates using the corrected observation-time EKF pose.
+8. The point cloud is accumulated and averaged into a voxel grid.
+9. The agent controller chooses and applies a motion command.
+10. Odometry noise is added to the command.
+11. The EKF prediction step advances the estimator to the post-motion state.
 12. Matplotlib artists are refreshed for display.
 
-The first eight steps are now handled by the headless simulation engine in [cave_slam/sim.py](/home/jon/cave_slam/cave_slam/sim.py). The final display step is handled separately in [cave_slam/viz.py](/home/jon/cave_slam/cave_slam/viz.py).
+This is now an explicit `observe -> update -> map -> move -> predict` timing model.
+
+The first eleven steps are now handled by the headless simulation engine in [cave_slam/sim.py](/home/jon/cave_slam/cave_slam/sim.py). The final display step is handled separately in [cave_slam/viz.py](/home/jon/cave_slam/cave_slam/viz.py).
 
 ### Environment Model
 
@@ -580,7 +582,7 @@ Recommended tuning guidance:
   - normalized innovation squared threshold used to reject outlier EKF updates
   - larger values are more permissive
   - smaller values reject more updates
-  - the default is intentionally fairly loose because the current simulation timing model is not a textbook predict-then-observe pipeline
+  - the default is intentionally fairly loose because this simulation now uses an explicit `observe -> update -> move -> predict` loop rather than a stricter robotics middleware timing model
 
 ### `ekf.augmentation`
 

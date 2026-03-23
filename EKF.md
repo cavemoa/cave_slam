@@ -358,16 +358,18 @@ At a high level, each simulation step currently does the following:
 6. Associate feature observations against the track layer.
 7. Update the visual landmark layer.
 8. Update the landmark track layer using the association result.
-9. Update the accumulated point cloud and voxel map.
-10. Step the agent and generate noisy odometry.
-11. Run EKF prediction.
-12. Run either:
+9. Run either:
     - pose-only correction, or
     - full-state augmentation and update
-13. Compute EKF diagnostics.
-14. Sync augmented landmark positions back into the track layer in `full_slam` mode.
+10. Sync augmented landmark positions back into the track layer in `full_slam` mode.
+11. Update the accumulated point cloud and voxel map using the corrected observation-time estimate.
+12. Step the agent and generate noisy odometry.
+13. Run EKF prediction to advance the state to the post-motion estimate.
+14. Compute EKF diagnostics.
 
-This ordering reflects the current experimental simulation architecture. It is good enough for exploring ideas, but it is still more tightly coupled to the simulation loop than a production robotics pipeline would be.
+This is now an explicit `observe -> update -> map -> move -> predict` timing model.
+
+That is more internally consistent for this simulation than the earlier pattern where observations came from the pre-motion pose but correction happened only after prediction.
 
 ## How Full-SLAM Correction Works In Practice
 
@@ -497,7 +499,7 @@ It is not the same thing as association gating:
 - association gating decides whether an observation matches a track
 - NIS gating decides whether the matched observation should actually be allowed to update the filter
 
-The default threshold in this project is intentionally more permissive than a strict textbook chi-square threshold, because the current simulation loop is still an experimental observe/move/update pipeline rather than a perfectly clean predict-then-observe estimator timing model.
+The default threshold in this project is intentionally more permissive than a strict textbook chi-square threshold, because the simulation uses an explicit `observe -> update -> move -> predict` loop rather than a stricter robotics middleware timing model.
 
 In `full_slam` mode, the correction path uses associated track observations rather than the truth harness.
 

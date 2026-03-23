@@ -1005,46 +1005,6 @@ def step_simulation(state: SimulationState):
         protected_track_ids=tuple(slam_state.ekf_slam_index.state_track_ids),
     )
     slam_state.landmark_track_state = track_update_result.track_state
-
-    mapped_x, mapped_y = transform_measurements(lidar_scan.measurements, slam_state.mu)
-    slam_state.point_cloud_x.extend(mapped_x)
-    slam_state.point_cloud_y.extend(mapped_y)
-
-    averaged_x, averaged_y = update_voxel_grid(
-        mapped_x,
-        mapped_y,
-        lidar_scan.measurements,
-        slam_state.voxel_state,
-        state.config.voxel_grid,
-        state.config.sensor,
-        current_frame,
-    )
-    slam_state.voxel_points_x[:] = averaged_x
-    slam_state.voxel_points_y[:] = averaged_y
-
-    command = step_agent(
-        state.agent_state,
-        lidar_scan.min_dist_forward,
-        lidar_scan.scan_samples,
-        state.config.motion,
-        state.config.agent.startup_behavior,
-        state.walls,
-        state.rng,
-    )
-
-    measured_turn = command.turn + np.radians(state.config.odometry_noise.angle_std_deg) * state.rng.normal(0.0, 1.0)
-    if command.distance == 0.0:
-        measured_distance = 0.0
-    else:
-        measured_distance = max(0.0, command.distance + state.rng.normal(0.0, state.config.odometry_noise.distance_std))
-
-    slam_state.mu, slam_state.Sigma = ekf_predict(
-        slam_state.mu,
-        slam_state.Sigma,
-        measured_distance,
-        measured_turn,
-        state.config.odometry_noise,
-    )
     pre_update_mu = slam_state.mu.copy()
     pre_update_sigma = slam_state.Sigma.copy()
     augmented_landmark_track_ids: tuple[int, ...] = ()
@@ -1089,6 +1049,46 @@ def step_simulation(state: SimulationState):
         num_candidate_observations=num_candidate_observations,
         num_rejections=num_rejections,
         ambiguous_rejections=ambiguous_rejections,
+    )
+
+    mapped_x, mapped_y = transform_measurements(lidar_scan.measurements, slam_state.mu)
+    slam_state.point_cloud_x.extend(mapped_x)
+    slam_state.point_cloud_y.extend(mapped_y)
+
+    averaged_x, averaged_y = update_voxel_grid(
+        mapped_x,
+        mapped_y,
+        lidar_scan.measurements,
+        slam_state.voxel_state,
+        state.config.voxel_grid,
+        state.config.sensor,
+        current_frame,
+    )
+    slam_state.voxel_points_x[:] = averaged_x
+    slam_state.voxel_points_y[:] = averaged_y
+
+    command = step_agent(
+        state.agent_state,
+        lidar_scan.min_dist_forward,
+        lidar_scan.scan_samples,
+        state.config.motion,
+        state.config.agent.startup_behavior,
+        state.walls,
+        state.rng,
+    )
+
+    measured_turn = command.turn + np.radians(state.config.odometry_noise.angle_std_deg) * state.rng.normal(0.0, 1.0)
+    if command.distance == 0.0:
+        measured_distance = 0.0
+    else:
+        measured_distance = max(0.0, command.distance + state.rng.normal(0.0, state.config.odometry_noise.distance_std))
+
+    slam_state.mu, slam_state.Sigma = ekf_predict(
+        slam_state.mu,
+        slam_state.Sigma,
+        measured_distance,
+        measured_turn,
+        state.config.odometry_noise,
     )
     ekf_debug_info = compute_ekf_debug_info(slam_state.Sigma)
 
