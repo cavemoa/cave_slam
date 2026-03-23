@@ -375,12 +375,31 @@ In `full_slam` mode, the current implementation behaves as follows:
 
 - if an associated track is already in the EKF state:
   - apply a full-state EKF update
-- if an associated track is not yet in the EKF state:
+- if a track is not yet in the EKF state:
+  - keep it external until it is stable enough for augmentation
+- once an external track satisfies the augmentation stability rule:
   - augment the state with that landmark
-- if the track update layer created a new track this frame:
-  - augment the state with that new landmark as well
 
-This means the EKF state gradually grows as the agent accumulates distinct landmark tracks.
+This means the EKF state gradually grows as the agent accumulates distinct landmark tracks, but no longer grows immediately on first sighting.
+
+### Delayed Landmark Initialization
+
+Delayed landmark initialization is now part of `full_slam`.
+
+The goal is to avoid polluting the augmented EKF state with weak one-off detections.
+
+A landmark track must stay external until it satisfies at least one of these conditions:
+
+- `track.observation_count >= ekf.augmentation.min_observations`
+- `track.quality_score >= ekf.augmentation.min_track_quality`
+
+Only then is it promoted from the external track layer into the augmented EKF state.
+
+This makes the full-state estimator more conservative:
+
+- new detections are tracked first
+- unstable or fleeting landmarks remain outside the EKF state
+- only more reliable tracks become permanent EKF landmarks
 
 ## Diagnostics
 
@@ -498,6 +517,15 @@ This is separate from:
 - Mahalanobis gating
 - NIS-based EKF update rejection
 
+### `ekf.augmentation`
+
+- `min_observations`
+- `min_track_quality`
+
+These settings control delayed landmark initialization for `full_slam`.
+
+They decide when an external landmark track is considered stable enough to be augmented into the EKF state.
+
 ## Practical Tuning Notes
 
 If `full_slam` appears to augment landmarks but not update them often:
@@ -508,6 +536,7 @@ If `full_slam` appears to augment landmarks but not update them often:
 - lower `ekf.association.min_track_quality`
 - increase sensor field of view or number of rays
 - simplify the environment so the same features are seen repeatedly
+- lower `ekf.augmentation.min_observations` or `ekf.augmentation.min_track_quality` if augmentation is too conservative
 
 If the estimator becomes unstable:
 

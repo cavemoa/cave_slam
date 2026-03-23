@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Sequence
 import numpy as np
 
 if TYPE_CHECKING:
-    from .sim import FeatureExtractionConfig, MeasurementModelConfig, OdometryNoiseConfig, SensorConfig, VoxelGridConfig
+    from .sim import AugmentationConfig, FeatureExtractionConfig, MeasurementModelConfig, OdometryNoiseConfig, SensorConfig, VoxelGridConfig
 
 
 @dataclass(frozen=True)
@@ -1057,6 +1057,13 @@ def _compute_track_quality(observation_count: int, staleness_frames: int, ttl: i
     confidence = min(1.0, observation_count / 5.0)
     freshness = max(0.0, 1.0 - (staleness_frames / max(ttl, 1)))
     return float(confidence * freshness)
+
+
+def is_track_ready_for_augmentation(track: LandmarkTrack, augmentation_config: AugmentationConfig):
+    return (
+        track.observation_count >= augmentation_config.min_observations
+        or track.quality_score >= augmentation_config.min_track_quality
+    )
 
 
 def create_landmark_track(point: np.ndarray, frame_index: int, feature_config: FeatureExtractionConfig, track_id: int):

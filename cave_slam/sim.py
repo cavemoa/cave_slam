@@ -37,6 +37,7 @@ from .slam import (
     get_landmark_state_index,
     initialize_ekf_slam_state_index,
     initialize_landmark_track_state,
+    is_track_ready_for_augmentation,
     is_nis_accepted,
     measurements_to_world_points,
     simulate_lidar,
@@ -163,6 +164,10 @@ DEFAULT_CONFIG = {
             "min_track_quality": 0.1,
             "ambiguity_ratio_threshold": 1.1,
             "ambiguity_margin_threshold": 0.05,
+        },
+        "augmentation": {
+            "min_observations": 3,
+            "min_track_quality": 0.6,
         },
     },
 }
@@ -315,12 +320,19 @@ class AssociationConfig:
 
 
 @dataclass(frozen=True)
+class AugmentationConfig:
+    min_observations: int
+    min_track_quality: float
+
+
+@dataclass(frozen=True)
 class EkfConfig:
     mode: str
     measurement: MeasurementModelConfig
     truth_update: TruthUpdateConfig
     pose_update: PoseUpdateConfig
     association: AssociationConfig
+    augmentation: AugmentationConfig
 
 
 @dataclass(frozen=True)
@@ -487,6 +499,7 @@ def parse_config(raw_config: Mapping[str, Any]):
     ekf_truth_update = _require_mapping(ekf["truth_update"], "ekf.truth_update")
     ekf_pose_update = _require_mapping(ekf["pose_update"], "ekf.pose_update")
     ekf_association = _require_mapping(ekf["association"], "ekf.association")
+    ekf_augmentation = _require_mapping(ekf["augmentation"], "ekf.augmentation")
 
     walls_raw = environment.get("walls", [])
     if not isinstance(walls_raw, Sequence) or isinstance(walls_raw, (str, bytes)):
@@ -611,6 +624,10 @@ def parse_config(raw_config: Mapping[str, Any]):
                     ekf_association["ambiguity_margin_threshold"],
                     "ekf.association.ambiguity_margin_threshold",
                 ),
+            ),
+            augmentation=AugmentationConfig(
+                min_observations=_require_int(ekf_augmentation["min_observations"], "ekf.augmentation.min_observations"),
+                min_track_quality=_require_float(ekf_augmentation["min_track_quality"], "ekf.augmentation.min_track_quality"),
             ),
         ),
     )
@@ -871,18 +888,9 @@ def apply_full_slam_correction(
 
     for match in association_result.matched[:max_updates]:
         landmark_index = get_landmark_state_index(state.slam_state.ekf_slam_index, match.track_id)
-        observation = feature_observations[match.observation_index]
-
         if landmark_index is None:
-            state.slam_state.mu, state.slam_state.Sigma = augment_state_with_landmark(
-                state.slam_state.mu,
-                state.slam_state.Sigma,
-                observation,
-                state.config.ekf.measurement,
-            )
-            _register_augmented_landmark(state, match.track_id)
-            augmented_track_ids.append(match.track_id)
             continue
+        observation = feature_observations[match.observation_index]
 
         update_result = ekf_update_full_state(
             state.slam_state.mu,
@@ -899,11 +907,12 @@ def apply_full_slam_correction(
         update_results.append(update_result)
 
     for assignment in track_update_result.assignments:
-        if not assignment.created:
-            continue
         if get_landmark_state_index(state.slam_state.ekf_slam_index, assignment.track_id) is not None:
             continue
         if assignment.observation_index >= len(feature_observations):
+            continue
+        track = state.slam_state.landmark_track_state.tracks.get(assignment.track_id)
+        if track is None or not is_track_ready_for_augmentation(track, state.config.ekf.augmentation):
             continue
 
         state.slam_state.mu, state.slam_state.Sigma = augment_state_with_landmark(

@@ -304,6 +304,7 @@ The key EKF features currently implemented are:
 - nearest-neighbor and Mahalanobis association modes
 - ambiguity rejection for near-tied association candidates
 - pose-only EKF correction
+- delayed landmark initialization for `full_slam`
 - full EKF-SLAM state augmentation and full-state landmark updates
 - per-step EKF diagnostics and live overlay text
 
@@ -580,6 +581,18 @@ Recommended tuning guidance:
   - larger values are more permissive
   - smaller values reject more updates
   - the default is intentionally fairly loose because the current simulation timing model is not a textbook predict-then-observe pipeline
+
+### `ekf.augmentation`
+
+- `min_observations`
+  - minimum number of observations before an external landmark track can be promoted into the `full_slam` state
+- `min_track_quality`
+  - alternative quality threshold that also allows promotion into the `full_slam` state
+
+In `full_slam` mode, a new landmark is no longer augmented on first sighting. It stays external in the track layer until either:
+
+- it has been seen enough times, or
+- its track quality is high enough
 
 ### `ekf.association`
 
