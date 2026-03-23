@@ -109,6 +109,7 @@ class AssociationResult:
     matched: tuple[AssociationMatch, ...]
     unmatched_observations: tuple[int, ...]
     rejected: tuple[AssociationCandidate, ...]
+    ambiguous: tuple[AssociationCandidate, ...]
     method: str
     gating_applied: bool
 
@@ -149,6 +150,7 @@ class EkfStepDiagnostics:
     num_candidate_observations: int
     num_matches: int
     num_rejections: int
+    ambiguous_rejections: int
     trace_sigma_before: float
     trace_sigma_after: float
     pose_update_norm: float
@@ -237,6 +239,7 @@ def build_ekf_step_diagnostics(
     update_results: Sequence[EkfUpdateResult],
     num_candidate_observations: int,
     num_rejections: int = 0,
+    ambiguous_rejections: int = 0,
 ):
     innovation_stats = build_innovation_stats(update_results)
     nis_values = [stats.nis for stats in innovation_stats]
@@ -246,6 +249,7 @@ def build_ekf_step_diagnostics(
         num_candidate_observations=num_candidate_observations,
         num_matches=num_matches,
         num_rejections=num_rejections,
+        ambiguous_rejections=ambiguous_rejections,
         trace_sigma_before=float(np.trace(symmetrize_covariance(np.asarray(sigma_before_update, dtype=float)[:3, :3]))),
         trace_sigma_after=float(np.trace(symmetrize_covariance(np.asarray(sigma_after_update, dtype=float)[:3, :3]))),
         pose_update_norm=compute_pose_delta_norm(pose_before_update, pose_after_update),
@@ -343,9 +347,28 @@ def _build_empty_association_result(method: str, gating_applied: bool):
         matched=(),
         unmatched_observations=(),
         rejected=(),
+        ambiguous=(),
         method=method,
         gating_applied=gating_applied,
     )
+
+
+def is_association_ambiguous(
+    best_score: float,
+    second_best_score: float | None,
+    ambiguity_ratio_threshold: float,
+    ambiguity_margin_threshold: float,
+):
+    if second_best_score is None or not np.isfinite(second_best_score):
+        return False
+
+    margin = float(second_best_score - best_score)
+    if margin <= ambiguity_margin_threshold:
+        return True
+
+    safe_best_score = max(float(best_score), 1e-9)
+    score_ratio = float(second_best_score / safe_best_score)
+    return score_ratio <= ambiguity_ratio_threshold
 
 
 def associate_landmarks_nearest_neighbor(
@@ -353,6 +376,8 @@ def associate_landmarks_nearest_neighbor(
     track_state: LandmarkTrackState,
     max_distance: float,
     min_track_quality: float,
+    ambiguity_ratio_threshold: float,
+    ambiguity_margin_threshold: float,
     mu: np.ndarray | None = None,
     state_index: EkfSlamStateIndex | None = None,
 ):
@@ -362,11 +387,13 @@ def associate_landmarks_nearest_neighbor(
     unmatched_observations: list[int] = []
     matched: list[AssociationMatch] = []
     rejected: list[AssociationCandidate] = []
+    ambiguous: list[AssociationCandidate] = []
     used_track_ids: set[int] = set()
 
     for observation_index, observation in enumerate(observations):
         best_track = None
         best_distance = max_distance
+        second_best_distance: float | None = None
 
         for track in track_state.tracks.values():
             if track.track_id in used_track_ids or track.quality_score < min_track_quality:
@@ -381,28 +408,49 @@ def associate_landmarks_nearest_neighbor(
             )
             distance = float(np.linalg.norm(np.asarray(observation.world_position, dtype=float) - landmark_position))
             if distance <= best_distance:
+                second_best_distance = best_distance if best_track is not None else second_best_distance
                 best_distance = distance
                 best_track = track
+            elif second_best_distance is None or distance < second_best_distance:
+                second_best_distance = distance
 
         if best_track is None:
             unmatched_observations.append(observation_index)
             continue
 
-        innovation = np.zeros(2, dtype=float)
-        match = AssociationMatch(
+        candidate = AssociationCandidate(
             observation_index=observation_index,
             track_id=best_track.track_id,
-            innovation=innovation,
+            innovation=np.zeros(2, dtype=float),
             distance=best_distance,
             mahalanobis_distance=0.0,
         )
-        matched.append(match)
+        if is_association_ambiguous(
+            best_score=best_distance,
+            second_best_score=second_best_distance,
+            ambiguity_ratio_threshold=ambiguity_ratio_threshold,
+            ambiguity_margin_threshold=ambiguity_margin_threshold,
+        ):
+            ambiguous.append(candidate)
+            unmatched_observations.append(observation_index)
+            continue
+
+        matched.append(
+            AssociationMatch(
+                observation_index=candidate.observation_index,
+                track_id=candidate.track_id,
+                innovation=np.array(candidate.innovation, dtype=float, copy=True),
+                distance=candidate.distance,
+                mahalanobis_distance=candidate.mahalanobis_distance,
+            )
+        )
         used_track_ids.add(best_track.track_id)
 
     return AssociationResult(
         matched=tuple(matched),
         unmatched_observations=tuple(unmatched_observations),
         rejected=tuple(rejected),
+        ambiguous=tuple(ambiguous),
         method="nearest_neighbor",
         gating_applied=False,
     )
@@ -417,6 +465,8 @@ def associate_landmarks_mahalanobis(
     max_distance: float,
     mahalanobis_threshold: float,
     min_track_quality: float,
+    ambiguity_ratio_threshold: float,
+    ambiguity_margin_threshold: float,
     state_index: EkfSlamStateIndex | None = None,
 ):
     if not observations:
@@ -425,11 +475,13 @@ def associate_landmarks_mahalanobis(
     unmatched_observations: list[int] = []
     matched: list[AssociationMatch] = []
     rejected: list[AssociationCandidate] = []
+    ambiguous: list[AssociationCandidate] = []
     used_track_ids: set[int] = set()
 
     for observation_index, observation in enumerate(observations):
         z = observation_to_measurement_vector(observation)
         best_candidate: AssociationCandidate | None = None
+        second_best_candidate: AssociationCandidate | None = None
 
         for track in track_state.tracks.values():
             if track.track_id in used_track_ids or track.quality_score < min_track_quality:
@@ -464,9 +516,22 @@ def associate_landmarks_mahalanobis(
                 mahalanobis_distance=mahalanobis_distance,
             )
             if best_candidate is None or candidate.mahalanobis_distance < best_candidate.mahalanobis_distance:
+                second_best_candidate = best_candidate
                 best_candidate = candidate
+            elif second_best_candidate is None or candidate.mahalanobis_distance < second_best_candidate.mahalanobis_distance:
+                second_best_candidate = candidate
 
         if best_candidate is None:
+            unmatched_observations.append(observation_index)
+            continue
+
+        if is_association_ambiguous(
+            best_score=best_candidate.mahalanobis_distance,
+            second_best_score=None if second_best_candidate is None else second_best_candidate.mahalanobis_distance,
+            ambiguity_ratio_threshold=ambiguity_ratio_threshold,
+            ambiguity_margin_threshold=ambiguity_margin_threshold,
+        ):
+            ambiguous.append(best_candidate)
             unmatched_observations.append(observation_index)
             continue
 
@@ -489,6 +554,7 @@ def associate_landmarks_mahalanobis(
         matched=tuple(matched),
         unmatched_observations=tuple(unmatched_observations),
         rejected=tuple(rejected),
+        ambiguous=tuple(ambiguous),
         method="mahalanobis",
         gating_applied=True,
     )

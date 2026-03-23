@@ -219,6 +219,8 @@ Two association modes are supported:
 - `nearest_neighbor`
 - `mahalanobis`
 
+Both modes now also support ambiguity rejection.
+
 ### Nearest-Neighbor Association
 
 This mode uses Euclidean distance between:
@@ -239,6 +241,29 @@ This mode uses:
 If a landmark is already augmented into the EKF state, the full-state measurement Jacobian is used. If not, association falls back to a pose-only landmark prediction against the external track position.
 
 This means Mahalanobis association naturally gets more informative once landmarks have entered the EKF state.
+
+### Ambiguity Rejection
+
+After finding the best association candidate, the estimator can reject the match if the second-best candidate is too similar.
+
+This is intended to catch cases where:
+
+- two nearby tracks both look plausible
+- the best candidate is only marginally better than the runner-up
+- forcing a match would be more dangerous than skipping the update
+
+The current implementation supports two ambiguity tests:
+
+- ratio test
+  - reject if `second_best / best` is too small
+- margin test
+  - reject if `second_best - best` is too small
+
+For nearest-neighbor association, the score is Euclidean distance.
+
+For Mahalanobis association, the score is Mahalanobis distance.
+
+If either test indicates that the top two candidates are too close, the observation is treated as unmatched and counted as an ambiguous rejection rather than a normal matched update.
 
 ### Association Output
 
@@ -383,6 +408,7 @@ Contains:
 - `num_candidate_observations`
 - `num_matches`
 - `num_rejections`
+- `ambiguous_rejections`
 - `trace_sigma_before`
 - `trace_sigma_after`
 - `pose_update_norm`
@@ -399,6 +425,7 @@ The Matplotlib visualization shows a compact EKF panel with:
 - track count
 - number of landmark augmentations in the current frame
 - association method and counts
+- ambiguous rejection count
 - covariance trace change
 - pose update magnitude
 - NIS summary
@@ -461,12 +488,22 @@ In `full_slam` mode, the correction path uses associated track observations rath
 - `max_distance`
 - `mahalanobis_threshold`
 - `min_track_quality`
+- `ambiguity_ratio_threshold`
+- `ambiguity_margin_threshold`
+
+`ambiguity_ratio_threshold` and `ambiguity_margin_threshold` are used to reject associations whose best and second-best candidates are too similar.
+
+This is separate from:
+
+- Mahalanobis gating
+- NIS-based EKF update rejection
 
 ## Practical Tuning Notes
 
 If `full_slam` appears to augment landmarks but not update them often:
 
 - increase `ekf.association.max_distance`
+- increase `ekf.association.ambiguity_ratio_threshold` or `ekf.association.ambiguity_margin_threshold` if ambiguity rejection is too aggressive
 - try `nearest_neighbor` first before `mahalanobis`
 - lower `ekf.association.min_track_quality`
 - increase sensor field of view or number of rays

@@ -161,6 +161,8 @@ DEFAULT_CONFIG = {
             "max_distance": 0.75,
             "mahalanobis_threshold": 5.991,
             "min_track_quality": 0.1,
+            "ambiguity_ratio_threshold": 1.1,
+            "ambiguity_margin_threshold": 0.05,
         },
     },
 }
@@ -308,6 +310,8 @@ class AssociationConfig:
     max_distance: float
     mahalanobis_threshold: float
     min_track_quality: float
+    ambiguity_ratio_threshold: float
+    ambiguity_margin_threshold: float
 
 
 @dataclass(frozen=True)
@@ -599,6 +603,14 @@ def parse_config(raw_config: Mapping[str, Any]):
                     "ekf.association.mahalanobis_threshold",
                 ),
                 min_track_quality=_require_float(ekf_association["min_track_quality"], "ekf.association.min_track_quality"),
+                ambiguity_ratio_threshold=_require_float(
+                    ekf_association["ambiguity_ratio_threshold"],
+                    "ekf.association.ambiguity_ratio_threshold",
+                ),
+                ambiguity_margin_threshold=_require_float(
+                    ekf_association["ambiguity_margin_threshold"],
+                    "ekf.association.ambiguity_margin_threshold",
+                ),
             ),
         ),
     )
@@ -798,6 +810,8 @@ def associate_feature_observations(
             track_state,
             max_distance=association_config.max_distance,
             min_track_quality=association_config.min_track_quality,
+            ambiguity_ratio_threshold=association_config.ambiguity_ratio_threshold,
+            ambiguity_margin_threshold=association_config.ambiguity_margin_threshold,
             mu=state.slam_state.mu,
             state_index=state.slam_state.ekf_slam_index,
         )
@@ -811,6 +825,8 @@ def associate_feature_observations(
         max_distance=association_config.max_distance,
         mahalanobis_threshold=association_config.mahalanobis_threshold,
         min_track_quality=association_config.min_track_quality,
+        ambiguity_ratio_threshold=association_config.ambiguity_ratio_threshold,
+        ambiguity_margin_threshold=association_config.ambiguity_margin_threshold,
         state_index=state.slam_state.ekf_slam_index,
     )
 
@@ -1031,7 +1047,8 @@ def step_simulation(state: SimulationState):
             track_update_result,
         )
         num_candidate_observations = len(feature_observations)
-        num_rejections = len(association_result.rejected) + nis_rejection_count
+        ambiguous_rejections = len(association_result.ambiguous)
+        num_rejections = len(association_result.rejected) + ambiguous_rejections + nis_rejection_count
         slam_state.landmark_track_state = sync_landmark_tracks_with_state(
             slam_state.landmark_track_state,
             slam_state.ekf_slam_index,
@@ -1048,10 +1065,12 @@ def step_simulation(state: SimulationState):
         )
         if state.config.ekf.pose_update.use_truth_observations:
             num_candidate_observations = len(truth_observation_set.observations) if truth_observation_set is not None else 0
+            ambiguous_rejections = 0
             num_rejections = nis_rejection_count
         else:
             num_candidate_observations = len(feature_observations)
-            num_rejections = len(association_result.rejected) + nis_rejection_count
+            ambiguous_rejections = len(association_result.ambiguous)
+            num_rejections = len(association_result.rejected) + ambiguous_rejections + nis_rejection_count
     ekf_diagnostics = build_ekf_step_diagnostics(
         pose_before_update=pre_update_mu,
         pose_after_update=slam_state.mu,
@@ -1060,6 +1079,7 @@ def step_simulation(state: SimulationState):
         update_results=pose_update_results,
         num_candidate_observations=num_candidate_observations,
         num_rejections=num_rejections,
+        ambiguous_rejections=ambiguous_rejections,
     )
     ekf_debug_info = compute_ekf_debug_info(slam_state.Sigma)
 

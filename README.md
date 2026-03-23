@@ -302,6 +302,7 @@ The key EKF features currently implemented are:
 - truth-landmark observation harness for controlled testing
 - landmark track layer with stable track IDs
 - nearest-neighbor and Mahalanobis association modes
+- ambiguity rejection for near-tied association candidates
 - pose-only EKF correction
 - full EKF-SLAM state augmentation and full-state landmark updates
 - per-step EKF diagnostics and live overlay text
@@ -590,6 +591,15 @@ Recommended tuning guidance:
   - gating threshold used by Mahalanobis association
 - `min_track_quality`
   - minimum landmark-track quality required before a track can be associated
+- `ambiguity_ratio_threshold`
+  - rejects a match when the second-best candidate score is too close to the best candidate score in relative terms
+- `ambiguity_margin_threshold`
+  - rejects a match when the second-best candidate score is too close to the best candidate score in absolute terms
+
+These ambiguity checks apply before correction and are separate from:
+
+- Mahalanobis gating
+- NIS-based update rejection
 
 ## Outputs and Visual Elements
 
@@ -609,6 +619,7 @@ The visualization currently shows:
   - active track count
   - augmentation count
   - association summary
+  - ambiguous association rejection count
   - covariance and NIS summaries
 
 The visual runner also supports:
@@ -650,7 +661,7 @@ More recently, plotting was separated again into [cave_slam/viz.py](/home/jon/ca
 If you want to extend the project, the most natural next improvements are:
 
 - improve landmark lifecycle handling for augmented EKF-SLAM landmarks
-- add stronger outlier rejection and ambiguity handling around association
+- refine outlier rejection and ambiguity thresholds around association
 - experiment with different landmark feature types
 - improve temporal consistency between the observation and motion-update parts of the simulation loop
 - expose more controller parameters in the YAML file
