@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Literal, Sequence
 import numpy as np
 
 if TYPE_CHECKING:
-    from .sim import AugmentationConfig, FeatureExtractionConfig, MeasurementModelConfig, OdometryNoiseConfig, SensorConfig, VoxelGridConfig
+    from .sim import AssociationConfig, AugmentationConfig, FeatureExtractionConfig, MeasurementModelConfig, OdometryNoiseConfig, SensorConfig, VoxelGridConfig
 
 
 LandmarkType = Literal["corner", "line_segment", "endpoint", "junction"]
@@ -215,6 +215,25 @@ def normalize_angle(angle: float):
     return float((angle + np.pi) % (2 * np.pi) - np.pi)
 
 
+def normalize_line_orientation(angle: float):
+    return float(angle % np.pi)
+
+
+def line_orientation_difference(first: float, second: float):
+    difference = abs(normalize_line_orientation(first) - normalize_line_orientation(second))
+    return float(min(difference, np.pi - difference))
+
+
+def blend_line_orientation(current: float, observed: float, blend: float):
+    current_double = 2.0 * normalize_line_orientation(current)
+    observed_double = 2.0 * normalize_line_orientation(observed)
+    x_component = (1.0 - blend) * np.cos(current_double) + blend * np.cos(observed_double)
+    y_component = (1.0 - blend) * np.sin(current_double) + blend * np.sin(observed_double)
+    if abs(x_component) < 1e-9 and abs(y_component) < 1e-9:
+        return normalize_line_orientation(observed)
+    return normalize_line_orientation(0.5 * np.arctan2(y_component, x_component))
+
+
 def normalize_state_angle(mu: np.ndarray):
     mu[2] = normalize_angle(mu[2])
     return mu
@@ -353,6 +372,10 @@ def is_ekf_compatible_landmark_type(landmark_type: LandmarkType):
     return landmark_type in {"corner", "endpoint", "junction"}
 
 
+def typed_track_quality(track: LandmarkTrack):
+    return float(track.quality_score * np.clip(track.type_confidence, 0.0, 1.0))
+
+
 def initialize_ekf_slam_state_index():
     return EkfSlamStateIndex(track_id_to_index={}, state_track_ids=[])
 
@@ -386,6 +409,68 @@ def _candidate_distance(observation: LandmarkObservation, track: LandmarkTrack):
     if observation.world_position is None:
         return float("inf")
     return float(np.linalg.norm(np.asarray(observation.world_position, dtype=float) - track.position))
+
+
+def point_track_distance(
+    observation: LandmarkObservation,
+    landmark_position: np.ndarray,
+):
+    if observation.world_position is None:
+        return float("inf")
+    return float(np.linalg.norm(np.asarray(observation.world_position, dtype=float) - landmark_position))
+
+
+def line_track_distance(
+    observation: LandmarkObservation,
+    track: LandmarkTrack,
+    landmark_position: np.ndarray,
+    orientation_threshold_deg: float,
+    extent_ratio_threshold: float,
+    distance_scale: float,
+):
+    position_distance = point_track_distance(observation, landmark_position)
+    if not np.isfinite(position_distance):
+        return float("inf")
+
+    if observation.orientation is None or track.orientation is None:
+        return float("inf")
+
+    orientation_threshold_rad = np.radians(max(orientation_threshold_deg, 1e-6))
+    orientation_difference = line_orientation_difference(float(observation.orientation), float(track.orientation))
+    if orientation_difference > orientation_threshold_rad:
+        return float("inf")
+
+    if observation.extent is None or track.extent is None:
+        extent_ratio = 0.0
+    else:
+        extent_scale = max(abs(float(observation.extent)), abs(float(track.extent)), 1e-6)
+        extent_ratio = abs(float(observation.extent) - float(track.extent)) / extent_scale
+        if extent_ratio > extent_ratio_threshold:
+            return float("inf")
+
+    scale = max(distance_scale, 1e-6)
+    orientation_penalty = scale * (orientation_difference / orientation_threshold_rad)
+    extent_penalty = scale * (extent_ratio / max(extent_ratio_threshold, 1e-6))
+    return float(position_distance + 0.5 * orientation_penalty + 0.25 * extent_penalty)
+
+
+def landmark_track_distance(
+    observation: LandmarkObservation,
+    track: LandmarkTrack,
+    landmark_position: np.ndarray,
+    association_config: AssociationConfig,
+    distance_scale: float,
+):
+    if observation.landmark_type == "line_segment":
+        return line_track_distance(
+            observation,
+            track,
+            landmark_position,
+            association_config.line_orientation_threshold_deg,
+            association_config.line_extent_ratio_threshold,
+            distance_scale,
+        )
+    return point_track_distance(observation, landmark_position)
 
 
 def _build_empty_association_result(method: str, gating_applied: bool):
@@ -426,6 +511,7 @@ def is_association_ambiguous(
 def associate_landmarks_nearest_neighbor(
     observations: Sequence[LandmarkObservation],
     track_state: LandmarkTrackState,
+    association_config: AssociationConfig,
     max_distance: float,
     min_track_quality: float,
     ambiguity_ratio_threshold: float,
@@ -448,7 +534,7 @@ def associate_landmarks_nearest_neighbor(
         second_best_distance: float | None = None
 
         for track in track_state.tracks.values():
-            if track.track_id in used_track_ids or track.quality_score < min_track_quality:
+            if track.track_id in used_track_ids or typed_track_quality(track) < min_track_quality:
                 continue
             if observation.world_position is None:
                 continue
@@ -460,7 +546,13 @@ def associate_landmarks_nearest_neighbor(
                 track,
                 state_index,
             )
-            distance = float(np.linalg.norm(np.asarray(observation.world_position, dtype=float) - landmark_position))
+            distance = landmark_track_distance(
+                observation,
+                track,
+                landmark_position,
+                association_config,
+                max_distance,
+            )
             if distance <= best_distance:
                 second_best_distance = best_distance if best_track is not None else second_best_distance
                 best_distance = distance
@@ -513,6 +605,7 @@ def associate_landmarks_nearest_neighbor(
 def associate_landmarks_mahalanobis(
     observations: Sequence[LandmarkObservation],
     track_state: LandmarkTrackState,
+    association_config: AssociationConfig,
     mu: np.ndarray,
     Sigma: np.ndarray,
     measurement_config: MeasurementModelConfig,
@@ -538,16 +631,18 @@ def associate_landmarks_mahalanobis(
         second_best_candidate: AssociationCandidate | None = None
 
         for track in track_state.tracks.values():
-            if track.track_id in used_track_ids or track.quality_score < min_track_quality:
+            if track.track_id in used_track_ids or typed_track_quality(track) < min_track_quality:
                 continue
             if not can_associate_landmark_types(observation.landmark_type, track.landmark_type):
                 continue
 
             landmark_position = get_landmark_state_position(mu, track, state_index)
-            candidate_distance = (
-                float(np.linalg.norm(np.asarray(observation.world_position, dtype=float) - landmark_position))
-                if observation.world_position is not None
-                else float("inf")
+            candidate_distance = landmark_track_distance(
+                observation,
+                track,
+                landmark_position,
+                association_config,
+                max_distance,
             )
             if np.isfinite(candidate_distance) and candidate_distance > max_distance:
                 continue
@@ -1334,7 +1429,7 @@ def track_display_value(
     state_index: EkfSlamStateIndex,
 ):
     if mode == "quality":
-        return float(track.quality_score)
+        return typed_track_quality(track)
     if mode == "age":
         return float(track_age_frames(track, frame_index))
     if mode == "augmented":
@@ -1358,6 +1453,13 @@ def create_landmark_track(
 ):
     ttl = feature_config.persistence_frames
     covariance = np.eye(2, dtype=float) * (feature_config.association_radius ** 2)
+    orientation = None
+    if observation.orientation is not None:
+        orientation = (
+            normalize_line_orientation(float(observation.orientation))
+            if observation.landmark_type == "line_segment"
+            else float(observation.orientation)
+        )
     return LandmarkTrack(
         track_id=track_id,
         position=np.array(point, dtype=float, copy=True),
@@ -1367,9 +1469,9 @@ def create_landmark_track(
         ttl=ttl,
         quality_score=_compute_track_quality(1, 0, ttl),
         landmark_type=observation.landmark_type,
-        orientation=observation.orientation,
+        orientation=orientation,
         extent=observation.extent,
-        type_confidence=float(observation.confidence),
+        type_confidence=float(np.clip(observation.confidence, 0.0, 1.0)),
     )
 
 
@@ -1391,12 +1493,18 @@ def update_landmark_track(
 
     if observation.orientation is not None:
         if track.orientation is None:
-            track.orientation = float(observation.orientation)
+            if track.landmark_type == "line_segment":
+                track.orientation = normalize_line_orientation(float(observation.orientation))
+            else:
+                track.orientation = float(observation.orientation)
         else:
-            track.orientation = normalize_angle(0.5 * track.orientation + 0.5 * float(observation.orientation))
+            if track.landmark_type == "line_segment":
+                track.orientation = blend_line_orientation(track.orientation, float(observation.orientation), blend)
+            else:
+                track.orientation = normalize_angle((1.0 - blend) * track.orientation + blend * float(observation.orientation))
     if observation.extent is not None:
-        track.extent = float(observation.extent) if track.extent is None else float(0.5 * (track.extent + observation.extent))
-    track.type_confidence = float(max(track.type_confidence, observation.confidence))
+        track.extent = float(observation.extent) if track.extent is None else float((1.0 - blend) * track.extent + blend * observation.extent)
+    track.type_confidence = float((1.0 - blend) * track.type_confidence + blend * np.clip(observation.confidence, 0.0, 1.0))
 
     if track.covariance is not None:
         base_variance = feature_config.association_radius ** 2
@@ -1433,6 +1541,7 @@ def update_landmark_track_state(
     track_state: LandmarkTrackState,
     frame_index: int,
     feature_config: FeatureExtractionConfig,
+    association_config: AssociationConfig,
     protected_track_ids: Sequence[int] = (),
 ):
     prune_landmark_tracks(track_state, frame_index, protected_track_ids)
@@ -1472,7 +1581,15 @@ def update_landmark_track_state(
                 continue
             if not can_associate_landmark_types(observation.landmark_type, track.landmark_type):
                 continue
-            distance = float(np.linalg.norm(point_array - track.position))
+            if typed_track_quality(track) < association_config.min_track_quality:
+                continue
+            distance = landmark_track_distance(
+                observation,
+                track,
+                track.position,
+                association_config,
+                feature_config.association_radius,
+            )
             if distance <= best_distance:
                 best_distance = distance
                 best_track = track

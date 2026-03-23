@@ -187,6 +187,8 @@ DEFAULT_CONFIG = {
             "max_distance": 0.75,
             "mahalanobis_threshold": 5.991,
             "min_track_quality": 0.1,
+            "line_orientation_threshold_deg": 20.0,
+            "line_extent_ratio_threshold": 0.6,
             "ambiguity_ratio_threshold": 1.1,
             "ambiguity_margin_threshold": 0.05,
         },
@@ -353,6 +355,8 @@ class AssociationConfig:
     max_distance: float
     mahalanobis_threshold: float
     min_track_quality: float
+    line_orientation_threshold_deg: float
+    line_extent_ratio_threshold: float
     ambiguity_ratio_threshold: float
     ambiguity_margin_threshold: float
 
@@ -568,6 +572,18 @@ def parse_config(raw_config: Mapping[str, Any]):
         raise ValueError("occupancy_grid.occupied_threshold must be in the interval [0, 1]")
     if free_threshold >= occupied_threshold:
         raise ValueError("occupancy_grid.free_threshold must be smaller than occupancy_grid.occupied_threshold")
+    line_orientation_threshold_deg = _require_float(
+        ekf_association["line_orientation_threshold_deg"],
+        "ekf.association.line_orientation_threshold_deg",
+    )
+    line_extent_ratio_threshold = _require_float(
+        ekf_association["line_extent_ratio_threshold"],
+        "ekf.association.line_extent_ratio_threshold",
+    )
+    if line_orientation_threshold_deg <= 0.0:
+        raise ValueError("ekf.association.line_orientation_threshold_deg must be positive")
+    if line_extent_ratio_threshold < 0.0:
+        raise ValueError("ekf.association.line_extent_ratio_threshold must be non-negative")
 
     return AppConfig(
         simulation=SimulationConfig(
@@ -708,6 +724,8 @@ def parse_config(raw_config: Mapping[str, Any]):
                     "ekf.association.mahalanobis_threshold",
                 ),
                 min_track_quality=_require_float(ekf_association["min_track_quality"], "ekf.association.min_track_quality"),
+                line_orientation_threshold_deg=line_orientation_threshold_deg,
+                line_extent_ratio_threshold=line_extent_ratio_threshold,
                 ambiguity_ratio_threshold=_require_float(
                     ekf_association["ambiguity_ratio_threshold"],
                     "ekf.association.ambiguity_ratio_threshold",
@@ -959,6 +977,7 @@ def step_simulation(state: SimulationState):
         slam_state.landmark_track_state,
         current_frame,
         state.config.feature_extraction,
+        state.config.ekf.association,
         protected_track_ids=tuple(slam_state.ekf_slam_index.state_track_ids),
     )
     slam_state.landmark_track_state = track_update_result.track_state

@@ -207,6 +207,11 @@ For estimator stability, there is still a boundary:
 - `corner`, `endpoint`, and `junction` are treated as point-compatible EKF features
 - `line_segment` is currently kept external to the EKF state and used only in the typed track layer
 
+The typed track layer is now also type-aware in its matching rules:
+
+- `corner`, `endpoint`, and `junction` use point-style spatial association
+- `line_segment` uses midpoint position plus orientation and extent gating
+
 It currently supports:
 
 - track creation
@@ -231,10 +236,10 @@ Both modes now also support ambiguity rejection.
 
 ### Nearest-Neighbor Association
 
-This mode uses Euclidean distance between:
+This mode uses a type-aware distance score:
 
-- the observed landmark world point
-- the current track position
+- `corner`, `endpoint`, and `junction`: Euclidean distance between observed and tracked world position
+- `line_segment`: midpoint distance plus orientation and extent penalties, with hard rejection if the mismatch exceeds configured thresholds
 
 If the track has already been augmented into the EKF state, the state landmark position is used instead of the plain track centroid.
 
@@ -249,6 +254,8 @@ This mode uses:
 If a landmark is already augmented into the EKF state, the full-state measurement Jacobian is used. If not, association falls back to a pose-only landmark prediction against the external track position.
 
 This means Mahalanobis association naturally gets more informative once landmarks have entered the EKF state.
+
+For `line_segment` tracks, Mahalanobis association still uses midpoint range-bearing residuals only after the line has passed the type-aware orientation and extent gates. Line segments remain external to the EKF state in the current implementation.
 
 ### Ambiguity Rejection
 

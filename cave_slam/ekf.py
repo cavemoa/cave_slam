@@ -38,6 +38,7 @@ def associate_feature_observations(
         return associate_landmarks_nearest_neighbor(
             feature_observations,
             track_state,
+            association_config,
             max_distance=association_config.max_distance,
             min_track_quality=association_config.min_track_quality,
             ambiguity_ratio_threshold=association_config.ambiguity_ratio_threshold,
@@ -49,6 +50,7 @@ def associate_feature_observations(
     return associate_landmarks_mahalanobis(
         feature_observations,
         track_state,
+        association_config,
         state.slam_state.mu,
         state.slam_state.Sigma,
         state.config.ekf.measurement,

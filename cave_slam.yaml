@@ -102,6 +102,9 @@ ekf:
   mode: full_slam   # Use pose_only or full_slam to enable EKF state augmentation with landmarks
   pose_update:
     nis_threshold: 50.0   # Reject EKF correction updates whose normalized innovation is too large
+  association:
+    line_orientation_threshold_deg: 20.0   # Maximum orientation mismatch allowed for line-segment track matching
+    line_extent_ratio_threshold: 0.6   # Maximum normalized length mismatch allowed for line-segment track matching
   augmentation:
     min_observations: 3   # Do not augment a landmark into full_slam state until it has been seen enough times
     min_track_quality: 0.6   # Alternatively allow augmentation once the track quality is high enough

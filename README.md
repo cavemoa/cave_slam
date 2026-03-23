@@ -699,11 +699,15 @@ In `full_slam` mode, a new landmark is no longer augmented on first sighting. It
 - `method`
   - `nearest_neighbor` or `mahalanobis`
 - `max_distance`
-  - Euclidean candidate-distance filter for track association
+  - base position-distance filter for track association
 - `mahalanobis_threshold`
   - gating threshold used by Mahalanobis association
 - `min_track_quality`
-  - minimum landmark-track quality required before a track can be associated
+  - minimum type-aware landmark-track quality required before a track can be associated
+- `line_orientation_threshold_deg`
+  - maximum orientation mismatch allowed for line-segment track matching
+- `line_extent_ratio_threshold`
+  - maximum normalized extent mismatch allowed for line-segment track matching
 - `ambiguity_ratio_threshold`
   - rejects a match when the second-best candidate score is too close to the best candidate score in relative terms
 - `ambiguity_margin_threshold`
@@ -715,6 +719,11 @@ These ambiguity checks apply before correction and are separate from:
 - NIS-based update rejection
 
 Ambiguous feature observations are also kept out of the landmark-track update path, so a near-tied association does not quietly become a new external track and later get augmented into `full_slam`.
+
+For typed tracking:
+
+- `corner`, `endpoint`, and `junction` still use point-style position matching
+- `line_segment` matching now also checks orientation and extent similarity before a track is accepted or updated
 
 ## Outputs and Visual Elements
 
