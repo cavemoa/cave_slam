@@ -25,13 +25,20 @@ sensor:
     max_relative_std: 0.05
 
 feature_extraction:
+  enable_corners: true
+  enable_line_segments: true
+  enable_endpoints: true
+  enable_junctions: true
   window_size: 2
+  line_min_points: 3
   max_neighbor_gap: 1.0
   min_segment_span: 0.2
   max_line_residual: 0.12
   min_corner_angle_deg: 45
   max_corner_angle_deg: 135
   nms_radius: 1
+  junction_merge_distance: 0.3
+  endpoint_merge_distance: 0.25
   persistence_frames: 500
   association_radius: 0.35
 

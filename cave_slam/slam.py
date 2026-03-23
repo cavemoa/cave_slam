@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Literal, Sequence
 
 import numpy as np
 
 if TYPE_CHECKING:
     from .sim import AugmentationConfig, FeatureExtractionConfig, MeasurementModelConfig, OdometryNoiseConfig, SensorConfig, VoxelGridConfig
+
+
+LandmarkType = Literal["corner", "line_segment", "endpoint", "junction"]
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,10 @@ class LandmarkTrack:
     last_seen_frame: int
     ttl: int
     quality_score: float
+    landmark_type: LandmarkType = "corner"
+    orientation: float | None = None
+    extent: float | None = None
+    type_confidence: float = 1.0
 
 
 @dataclass
@@ -84,6 +91,34 @@ class LandmarkObservation:
     bearing: float
     world_position: np.ndarray | None = None
     source_id: int | None = None
+    landmark_type: LandmarkType = "corner"
+    orientation: float | None = None
+    extent: float | None = None
+    confidence: float = 1.0
+
+
+TypedLandmarkObservation = LandmarkObservation
+
+
+@dataclass(frozen=True)
+class ExtractedLandmark:
+    local_position: np.ndarray
+    landmark_type: LandmarkType
+    orientation: float | None = None
+    extent: float | None = None
+    confidence: float = 1.0
+    source_indices: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class LocalLineSegment:
+    start_point: np.ndarray
+    end_point: np.ndarray
+    centroid: np.ndarray
+    direction: np.ndarray
+    length: float
+    support_indices: tuple[int, ...]
+    residual: float
 
 
 @dataclass(frozen=True)
@@ -307,6 +342,17 @@ def observation_to_measurement_vector(observation: LandmarkObservation):
     return np.array([observation.range, observation.bearing], dtype=float)
 
 
+def can_associate_landmark_types(
+    observation_type: LandmarkType,
+    track_type: LandmarkType,
+):
+    return observation_type == track_type
+
+
+def is_ekf_compatible_landmark_type(landmark_type: LandmarkType):
+    return landmark_type in {"corner", "endpoint", "junction"}
+
+
 def initialize_ekf_slam_state_index():
     return EkfSlamStateIndex(track_id_to_index={}, state_track_ids=[])
 
@@ -406,6 +452,8 @@ def associate_landmarks_nearest_neighbor(
                 continue
             if observation.world_position is None:
                 continue
+            if not can_associate_landmark_types(observation.landmark_type, track.landmark_type):
+                continue
 
             landmark_position = get_landmark_state_position(
                 np.asarray(mu, dtype=float) if mu is not None else track.position,
@@ -491,6 +539,8 @@ def associate_landmarks_mahalanobis(
 
         for track in track_state.tracks.values():
             if track.track_id in used_track_ids or track.quality_score < min_track_quality:
+                continue
+            if not can_associate_landmark_types(observation.landmark_type, track.landmark_type):
                 continue
 
             landmark_position = get_landmark_state_position(mu, track, state_index)
@@ -954,15 +1004,38 @@ def suppress_nearby_corners(candidates, nms_radius: int):
     return sorted(selected, key=lambda item: item["index"])
 
 
-def extract_landmarks(measurements: Sequence[ScanMeasurement], config: FeatureExtractionConfig):
+def _local_points_from_measurements(measurements: Sequence[ScanMeasurement]):
+    return [
+        np.array(
+            [
+                measurement.distance * np.cos(measurement.angle),
+                measurement.distance * np.sin(measurement.angle),
+            ],
+            dtype=float,
+        )
+        for measurement in measurements
+    ]
+
+
+def _measurement_chains(local_points: Sequence[np.ndarray], max_neighbor_gap: float):
+    if not local_points:
+        return []
+
+    chains: list[list[int]] = [[0]]
+    for index in range(1, len(local_points)):
+        if np.linalg.norm(local_points[index] - local_points[index - 1]) <= max_neighbor_gap:
+            chains[-1].append(index)
+        else:
+            chains.append([index])
+    return chains
+
+
+def extract_corner_landmarks(measurements: Sequence[ScanMeasurement], config: FeatureExtractionConfig):
     window_size = config.window_size
     if len(measurements) < (2 * window_size + 1):
         return []
 
-    local_points = [
-        np.array([measurement.distance * np.cos(measurement.angle), measurement.distance * np.sin(measurement.angle)], dtype=float)
-        for measurement in measurements
-    ]
+    local_points = _local_points_from_measurements(measurements)
 
     candidates = []
     for index in range(window_size, len(local_points) - window_size):
@@ -998,7 +1071,188 @@ def extract_landmarks(measurements: Sequence[ScanMeasurement], config: FeatureEx
         candidates.append({"index": index, "score": corner_angle_deg})
 
     filtered_candidates = suppress_nearby_corners(candidates, config.nms_radius)
-    return [measurements[candidate["index"]] for candidate in filtered_candidates]
+    return [
+        ExtractedLandmark(
+            local_position=np.array(local_points[candidate["index"]], dtype=float, copy=True),
+            landmark_type="corner",
+            confidence=float(np.clip(candidate["score"] / max(config.max_corner_angle_deg, 1e-6), 0.0, 1.0)),
+            source_indices=(candidate["index"],),
+        )
+        for candidate in filtered_candidates
+    ]
+
+
+def _fit_local_line_segments(measurements: Sequence[ScanMeasurement], config: FeatureExtractionConfig):
+    local_points = _local_points_from_measurements(measurements)
+    line_segments: list[LocalLineSegment] = []
+
+    for chain in _measurement_chains(local_points, config.max_neighbor_gap):
+        if len(chain) < config.line_min_points:
+            continue
+
+        chain_points = [local_points[index] for index in chain]
+        start_point = np.array(chain_points[0], dtype=float, copy=True)
+        end_point = np.array(chain_points[-1], dtype=float, copy=True)
+        segment_length = float(np.linalg.norm(end_point - start_point))
+        if segment_length < config.min_segment_span:
+            continue
+
+        centroid, direction = fit_line_direction(chain_points)
+        residuals = [point_line_distance(point, centroid, direction) for point in chain_points]
+        mean_residual = float(np.mean(residuals)) if residuals else float("inf")
+        if mean_residual > config.max_line_residual:
+            continue
+
+        line_segments.append(
+            LocalLineSegment(
+                start_point=start_point,
+                end_point=end_point,
+                centroid=np.array(centroid, dtype=float, copy=True),
+                direction=np.array(direction, dtype=float, copy=True),
+                length=segment_length,
+                support_indices=tuple(chain),
+                residual=mean_residual,
+            )
+        )
+
+    return line_segments
+
+
+def extract_line_segments(measurements: Sequence[ScanMeasurement], config: FeatureExtractionConfig):
+    line_segments = _fit_local_line_segments(measurements, config)
+    extracted: list[ExtractedLandmark] = []
+    for segment in line_segments:
+        orientation = normalize_angle(float(np.arctan2(segment.direction[1], segment.direction[0])))
+        support_confidence = min(1.0, len(segment.support_indices) / max(config.line_min_points + 2, 1))
+        residual_scale = max(config.max_line_residual, 1e-6)
+        residual_confidence = max(0.0, 1.0 - (segment.residual / residual_scale))
+        extracted.append(
+            ExtractedLandmark(
+                local_position=np.array(segment.centroid, dtype=float, copy=True),
+                landmark_type="line_segment",
+                orientation=orientation,
+                extent=float(segment.length),
+                confidence=float(np.clip(0.5 * (support_confidence + residual_confidence), 0.0, 1.0)),
+                source_indices=segment.support_indices,
+            )
+        )
+    return extracted
+
+
+def _deduplicate_extracted_landmarks(
+    landmarks: Sequence[ExtractedLandmark],
+    distance_threshold: float,
+):
+    deduplicated: list[ExtractedLandmark] = []
+    for landmark in sorted(landmarks, key=lambda item: item.confidence, reverse=True):
+        if any(
+            landmark.landmark_type == existing.landmark_type
+            and np.linalg.norm(landmark.local_position - existing.local_position) <= distance_threshold
+            for existing in deduplicated
+        ):
+            continue
+        deduplicated.append(landmark)
+    return deduplicated
+
+
+def extract_junction_landmarks(measurements: Sequence[ScanMeasurement], config: FeatureExtractionConfig):
+    line_segments = _fit_local_line_segments(measurements, config)
+    junctions: list[ExtractedLandmark] = []
+
+    for first_index, first_segment in enumerate(line_segments):
+        first_orientation = float(np.arctan2(first_segment.direction[1], first_segment.direction[0]))
+        for second_segment in line_segments[first_index + 1:]:
+            second_orientation = float(np.arctan2(second_segment.direction[1], second_segment.direction[0]))
+            alignment = np.clip(abs(np.dot(first_segment.direction, second_segment.direction)), 0.0, 1.0)
+            junction_angle_deg = float(np.degrees(np.arccos(alignment)))
+            if not (config.min_corner_angle_deg <= junction_angle_deg <= config.max_corner_angle_deg):
+                continue
+
+            endpoint_pairs = (
+                (first_segment.start_point, second_segment.start_point),
+                (first_segment.start_point, second_segment.end_point),
+                (first_segment.end_point, second_segment.start_point),
+                (first_segment.end_point, second_segment.end_point),
+            )
+            pair_distances = [float(np.linalg.norm(first_point - second_point)) for first_point, second_point in endpoint_pairs]
+            pair_index = int(np.argmin(pair_distances))
+            if pair_distances[pair_index] > config.junction_merge_distance:
+                continue
+
+            first_point, second_point = endpoint_pairs[pair_index]
+            position = 0.5 * (np.asarray(first_point, dtype=float) + np.asarray(second_point, dtype=float))
+            orientation = normalize_angle(0.5 * (first_orientation + second_orientation))
+            confidence = float(
+                np.clip(
+                    0.5 * (
+                        min(1.0, junction_angle_deg / max(config.max_corner_angle_deg, 1e-6))
+                        + min(1.0, 1.0 - (pair_distances[pair_index] / max(config.junction_merge_distance, 1e-6)))
+                    ),
+                    0.0,
+                    1.0,
+                )
+            )
+            source_indices = tuple(sorted(set(first_segment.support_indices + second_segment.support_indices)))
+            junctions.append(
+                ExtractedLandmark(
+                    local_position=np.array(position, dtype=float, copy=True),
+                    landmark_type="junction",
+                    orientation=orientation,
+                    confidence=confidence,
+                    source_indices=source_indices,
+                )
+            )
+
+    return _deduplicate_extracted_landmarks(junctions, config.endpoint_merge_distance)
+
+
+def extract_endpoint_landmarks(measurements: Sequence[ScanMeasurement], config: FeatureExtractionConfig):
+    line_segments = _fit_local_line_segments(measurements, config)
+    junctions = extract_junction_landmarks(measurements, config)
+    endpoints: list[ExtractedLandmark] = []
+
+    for segment in line_segments:
+        orientation = normalize_angle(float(np.arctan2(segment.direction[1], segment.direction[0])))
+        endpoint_indices = (
+            segment.support_indices[:1],
+            segment.support_indices[-1:],
+        )
+        for point, source_index in zip((segment.start_point, segment.end_point), endpoint_indices):
+            if any(np.linalg.norm(point - junction.local_position) <= config.endpoint_merge_distance for junction in junctions):
+                continue
+            confidence = float(np.clip(min(1.0, segment.length / max(config.min_segment_span * 2.0, 1e-6)), 0.0, 1.0))
+            endpoints.append(
+                ExtractedLandmark(
+                    local_position=np.array(point, dtype=float, copy=True),
+                    landmark_type="endpoint",
+                    orientation=orientation,
+                    confidence=confidence,
+                    source_indices=tuple(source_index),
+                )
+            )
+
+    return _deduplicate_extracted_landmarks(endpoints, config.endpoint_merge_distance)
+
+
+def extract_landmarks(measurements: Sequence[ScanMeasurement], config: FeatureExtractionConfig):
+    extracted: list[ExtractedLandmark] = []
+    if config.enable_corners:
+        extracted.extend(extract_corner_landmarks(measurements, config))
+    if config.enable_line_segments:
+        extracted.extend(extract_line_segments(measurements, config))
+    if config.enable_junctions:
+        extracted.extend(extract_junction_landmarks(measurements, config))
+    if config.enable_endpoints:
+        extracted.extend(extract_endpoint_landmarks(measurements, config))
+
+    return sorted(
+        extracted,
+        key=lambda landmark: (
+            float(np.arctan2(landmark.local_position[1], landmark.local_position[0])),
+            float(np.linalg.norm(landmark.local_position)),
+            landmark.landmark_type,
+        ),
+    )
 
 
 def transform_measurements(measurements: Sequence[ScanMeasurement], pose: np.ndarray):
@@ -1095,7 +1349,13 @@ def is_track_ready_for_augmentation(track: LandmarkTrack, augmentation_config: A
     )
 
 
-def create_landmark_track(point: np.ndarray, frame_index: int, feature_config: FeatureExtractionConfig, track_id: int):
+def create_landmark_track(
+    point: np.ndarray,
+    observation: LandmarkObservation,
+    frame_index: int,
+    feature_config: FeatureExtractionConfig,
+    track_id: int,
+):
     ttl = feature_config.persistence_frames
     covariance = np.eye(2, dtype=float) * (feature_config.association_radius ** 2)
     return LandmarkTrack(
@@ -1106,12 +1366,17 @@ def create_landmark_track(point: np.ndarray, frame_index: int, feature_config: F
         last_seen_frame=frame_index,
         ttl=ttl,
         quality_score=_compute_track_quality(1, 0, ttl),
+        landmark_type=observation.landmark_type,
+        orientation=observation.orientation,
+        extent=observation.extent,
+        type_confidence=float(observation.confidence),
     )
 
 
 def update_landmark_track(
     track: LandmarkTrack,
     point: np.ndarray,
+    observation: LandmarkObservation,
     frame_index: int,
     feature_config: FeatureExtractionConfig,
 ):
@@ -1122,6 +1387,16 @@ def update_landmark_track(
     track.last_seen_frame = frame_index
     track.ttl = feature_config.persistence_frames
     track.quality_score = _compute_track_quality(track.observation_count, 0, track.ttl)
+    track.landmark_type = observation.landmark_type
+
+    if observation.orientation is not None:
+        if track.orientation is None:
+            track.orientation = float(observation.orientation)
+        else:
+            track.orientation = normalize_angle(0.5 * track.orientation + 0.5 * float(observation.orientation))
+    if observation.extent is not None:
+        track.extent = float(observation.extent) if track.extent is None else float(0.5 * (track.extent + observation.extent))
+    track.type_confidence = float(max(track.type_confidence, observation.confidence))
 
     if track.covariance is not None:
         base_variance = feature_config.association_radius ** 2
@@ -1153,6 +1428,7 @@ def prune_landmark_tracks(
 
 def update_landmark_track_state(
     world_points: Sequence[np.ndarray],
+    observations: Sequence[LandmarkObservation],
     association_result: AssociationResult,
     track_state: LandmarkTrackState,
     frame_index: int,
@@ -1167,24 +1443,34 @@ def update_landmark_track_state(
 
     for match in association_result.matched:
         track = track_state.tracks.get(match.track_id)
-        if track is None or match.observation_index >= len(world_points):
+        if track is None or match.observation_index >= len(world_points) or match.observation_index >= len(observations):
             continue
 
         point_array = np.asarray(world_points[match.observation_index], dtype=float)
-        update_landmark_track(track, point_array, frame_index, feature_config)
+        observation = observations[match.observation_index]
+        if not can_associate_landmark_types(observation.landmark_type, track.landmark_type):
+            continue
+        update_landmark_track(track, point_array, observation, frame_index, feature_config)
         assignments.append(TrackAssignment(observation_index=match.observation_index, track_id=track.track_id, created=False))
         matched_observation_indices.add(match.observation_index)
         used_track_ids.add(track.track_id)
 
     for observation_index, point in enumerate(world_points):
-        if observation_index in matched_observation_indices or observation_index in ambiguous_observation_indices:
+        if (
+            observation_index in matched_observation_indices
+            or observation_index in ambiguous_observation_indices
+            or observation_index >= len(observations)
+        ):
             continue
 
         point_array = np.asarray(point, dtype=float)
+        observation = observations[observation_index]
         best_track = None
         best_distance = feature_config.association_radius
         for track in track_state.tracks.values():
             if track.track_id in protected_track_ids or track.track_id in used_track_ids:
+                continue
+            if not can_associate_landmark_types(observation.landmark_type, track.landmark_type):
                 continue
             distance = float(np.linalg.norm(point_array - track.position))
             if distance <= best_distance:
@@ -1192,12 +1478,12 @@ def update_landmark_track_state(
                 best_track = track
 
         if best_track is not None:
-            update_landmark_track(best_track, point_array, frame_index, feature_config)
+            update_landmark_track(best_track, point_array, observation, frame_index, feature_config)
             assignments.append(TrackAssignment(observation_index=observation_index, track_id=best_track.track_id, created=False))
             used_track_ids.add(best_track.track_id)
         else:
             track_id = track_state.next_track_id
-            track_state.tracks[track_id] = create_landmark_track(point_array, frame_index, feature_config, track_id)
+            track_state.tracks[track_id] = create_landmark_track(point_array, observation, frame_index, feature_config, track_id)
             track_state.next_track_id += 1
             assignments.append(TrackAssignment(observation_index=observation_index, track_id=track_id, created=True))
             used_track_ids.add(track_id)

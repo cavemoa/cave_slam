@@ -15,6 +15,7 @@ from .sim import AppConfig, SimulationState, create_simulation, step_simulation
 class PlotArtists:
     fig: object
     ax: object
+    occupancy_image: object
     scatter_cloud: object
     voxel_scatter: object
     landmark_scatter: object
@@ -147,6 +148,41 @@ def _track_colors(state: SimulationState):
     return np.asarray(cmap(normalized), dtype=float)
 
 
+def _build_occupancy_rgba(state: SimulationState):
+    occupancy_config = state.config.occupancy_grid
+    grid_state = state.slam_state.occupancy_grid_state
+    log_odds = np.asarray(grid_state.log_odds, dtype=float)
+
+    if log_odds.size == 0:
+        return np.zeros((0, 0, 4), dtype=float)
+
+    probabilities = 1.0 / (1.0 + np.exp(-log_odds))
+    rgba = np.zeros(log_odds.shape + (4,), dtype=float)
+    evidence_scale = max(abs(occupancy_config.log_odds_min), abs(occupancy_config.log_odds_max), 1e-9)
+    evidence = np.clip(np.abs(log_odds) / evidence_scale, 0.0, 1.0)
+
+    free_mask = probabilities <= occupancy_config.free_threshold
+    occupied_mask = probabilities >= occupancy_config.occupied_threshold
+    unknown_mask = ~(free_mask | occupied_mask)
+
+    rgba[free_mask, 0] = 1.0
+    rgba[free_mask, 1] = 1.0
+    rgba[free_mask, 2] = 1.0
+    rgba[free_mask, 3] = 0.08 + 0.20 * evidence[free_mask]
+
+    rgba[occupied_mask, 0] = 0.12
+    rgba[occupied_mask, 1] = 0.12
+    rgba[occupied_mask, 2] = 0.12
+    rgba[occupied_mask, 3] = 0.15 + 0.70 * evidence[occupied_mask]
+
+    rgba[unknown_mask, 0] = 0.65
+    rgba[unknown_mask, 1] = 0.65
+    rgba[unknown_mask, 2] = 0.65
+    rgba[unknown_mask, 3] = 0.06 * evidence[unknown_mask]
+
+    return rgba
+
+
 def create_plot(state: SimulationState):
     _, plt = import_matplotlib_modules()
     fig, ax = plt.subplots(figsize=state.config.plot.figsize)
@@ -157,13 +193,31 @@ def create_plot(state: SimulationState):
     ax.set_xlabel("X coordinate")
     ax.set_ylabel("Y coordinate")
 
-    for wall in state.walls:
-        ax.plot([wall.start[0], wall.end[0]], [wall.start[1], wall.end[1]], "k-", alpha=0.3, linewidth=2)
+    occupancy_state = state.slam_state.occupancy_grid_state
+    occupancy_extent = (
+        occupancy_state.origin_x,
+        occupancy_state.origin_x + occupancy_state.width_cells * occupancy_state.cell_size,
+        occupancy_state.origin_y,
+        occupancy_state.origin_y + occupancy_state.height_cells * occupancy_state.cell_size,
+    )
+    occupancy_image = ax.imshow(
+        _build_occupancy_rgba(state),
+        origin="lower",
+        extent=occupancy_extent,
+        interpolation="nearest",
+        zorder=0,
+    )
+    occupancy_image.set_visible(state.config.plot.show_occupancy_grid and state.config.occupancy_grid.enabled)
 
-    scatter_cloud = ax.scatter([], [], s=state.config.plot.point_size, c="blue", alpha=state.config.plot.point_alpha, label="Raw Point Cloud")
-    voxel_scatter = ax.scatter([], [], s=state.config.voxel_grid.point_size, c=state.config.voxel_grid.color, alpha=state.config.voxel_grid.point_alpha, label="Voxel Grid")
-    landmark_scatter = ax.scatter([], [], s=80, facecolors="none", edgecolors="red", linewidths=2, label="Detected Landmarks")
-    track_scatter = ax.scatter([], [], s=40, linewidths=0.5, edgecolors="black", alpha=0.95, label="Landmark Tracks")
+    for wall in state.walls:
+        ax.plot([wall.start[0], wall.end[0]], [wall.start[1], wall.end[1]], "k-", alpha=0.3, linewidth=2, zorder=3)
+
+    scatter_cloud = ax.scatter([], [], s=state.config.plot.point_size, c="blue", alpha=state.config.plot.point_alpha, label="Raw Point Cloud", zorder=1)
+    voxel_scatter = ax.scatter([], [], s=state.config.voxel_grid.point_size, c=state.config.voxel_grid.color, alpha=state.config.voxel_grid.point_alpha, label="Voxel Grid", zorder=2)
+    landmark_scatter = ax.scatter([], [], s=80, facecolors="none", edgecolors="red", linewidths=2, label="Detected Landmarks", zorder=4)
+    track_scatter = ax.scatter([], [], s=40, linewidths=0.5, edgecolors="black", alpha=0.95, label="Landmark Tracks", zorder=4)
+    scatter_cloud.set_visible(state.config.plot.show_point_cloud)
+    voxel_scatter.set_visible(state.config.plot.show_voxel_grid)
     track_scatter.set_visible(state.config.plot.show_landmark_tracks)
 
     true_traj_line, = ax.plot([], [], "g--", alpha=0.8, label="True Trajectory")
@@ -192,6 +246,7 @@ def create_plot(state: SimulationState):
     return PlotArtists(
         fig=fig,
         ax=ax,
+        occupancy_image=occupancy_image,
         scatter_cloud=scatter_cloud,
         voxel_scatter=voxel_scatter,
         landmark_scatter=landmark_scatter,
@@ -216,7 +271,11 @@ def render_simulation(state: SimulationState):
     agent_state = state.agent_state
 
     artists.scatter_cloud.set_offsets(np.c_[slam_state.point_cloud_x, slam_state.point_cloud_y])
+    artists.scatter_cloud.set_visible(state.config.plot.show_point_cloud)
     artists.voxel_scatter.set_offsets(np.c_[slam_state.voxel_points_x, slam_state.voxel_points_y])
+    artists.voxel_scatter.set_visible(state.config.plot.show_voxel_grid)
+    artists.occupancy_image.set_data(_build_occupancy_rgba(state))
+    artists.occupancy_image.set_visible(state.config.plot.show_occupancy_grid and state.config.occupancy_grid.enabled)
 
     if slam_state.persistent_landmarks:
         landmark_positions = np.array([landmark.position for landmark in slam_state.persistent_landmarks], dtype=float)
@@ -273,6 +332,7 @@ def render_simulation(state: SimulationState):
     artists.status_text.set_text(_build_status_text(state) + pause_suffix)
 
     return (
+        artists.occupancy_image,
         artists.scatter_cloud,
         artists.voxel_scatter,
         artists.landmark_scatter,

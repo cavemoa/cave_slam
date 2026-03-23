@@ -15,11 +15,13 @@ from .ekf import (
     apply_pose_only_ekf_correction,
     associate_feature_observations,
 )
+from .occupancy import OccupancyGridConfig, OccupancyGridState, initialize_occupancy_grid, update_occupancy_from_scan
 from .slam import (
     AssociationResult,
     EkfDebugInfo,
     EkfSlamStateIndex,
     EkfStepDiagnostics,
+    ExtractedLandmark,
     LidarScan,
     EkfUpdateResult,
     LandmarkTrackState,
@@ -36,7 +38,6 @@ from .slam import (
     extract_truth_landmark_positions,
     initialize_ekf_slam_state_index,
     initialize_landmark_track_state,
-    measurements_to_world_points,
     simulate_lidar,
     simulate_landmark_observations_from_truth,
     sync_landmark_tracks_with_state,
@@ -79,13 +80,20 @@ DEFAULT_CONFIG = {
         },
     },
     "feature_extraction": {
+        "enable_corners": True,
+        "enable_line_segments": True,
+        "enable_endpoints": True,
+        "enable_junctions": True,
         "window_size": 2,
+        "line_min_points": 3,
         "max_neighbor_gap": 1.0,
         "min_segment_span": 0.2,
         "max_line_residual": 0.12,
         "min_corner_angle_deg": 45,
         "max_corner_angle_deg": 135,
         "nms_radius": 1,
+        "junction_merge_distance": 0.3,
+        "endpoint_merge_distance": 0.25,
         "persistence_frames": 25,
         "association_radius": 0.35,
     },
@@ -115,6 +123,21 @@ DEFAULT_CONFIG = {
         "best_observation_override": True,
         "best_observation_max_distance": 4.0,
     },
+    "occupancy_grid": {
+        "enabled": True,
+        "cell_size": 0.2,
+        "width": 17.0,
+        "height": 17.0,
+        "origin_x": -1.0,
+        "origin_y": -1.0,
+        "log_odds_hit": 0.85,
+        "log_odds_free": 0.4,
+        "log_odds_min": -4.0,
+        "log_odds_max": 4.0,
+        "occupied_threshold": 0.65,
+        "free_threshold": 0.35,
+        "ray_subsample": 1,
+    },
     "agent": {
         "initial_pose": {
             "x": 2.0,
@@ -134,6 +157,9 @@ DEFAULT_CONFIG = {
         "ylim": [-1, 16],
         "point_size": 10,
         "point_alpha": 0.08,
+        "show_point_cloud": True,
+        "show_voxel_grid": True,
+        "show_occupancy_grid": True,
         "show_ekf_overlay": True,
         "show_landmark_tracks": True,
         "track_color_mode": "quality",
@@ -213,13 +239,20 @@ class SensorConfig:
 
 @dataclass(frozen=True)
 class FeatureExtractionConfig:
+    enable_corners: bool
+    enable_line_segments: bool
+    enable_endpoints: bool
+    enable_junctions: bool
     window_size: int
+    line_min_points: int
     max_neighbor_gap: float
     min_segment_span: float
     max_line_residual: float
     min_corner_angle_deg: float
     max_corner_angle_deg: float
     nms_radius: int
+    junction_merge_distance: float
+    endpoint_merge_distance: float
     persistence_frames: int
     association_radius: float
 
@@ -284,6 +317,9 @@ class PlotConfig:
     ylim: tuple[float, float]
     point_size: float
     point_alpha: float
+    show_point_cloud: bool
+    show_voxel_grid: bool
+    show_occupancy_grid: bool
     show_ekf_overlay: bool
     show_landmark_tracks: bool
     track_color_mode: str
@@ -346,6 +382,7 @@ class AppConfig:
     motion: MotionConfig
     odometry_noise: OdometryNoiseConfig
     voxel_grid: VoxelGridConfig
+    occupancy_grid: OccupancyGridConfig
     agent: AgentConfig
     plot: PlotConfig
     ekf: EkfConfig
@@ -361,6 +398,7 @@ class SlamState:
     voxel_points_x: list[float]
     voxel_points_y: list[float]
     voxel_state: dict
+    occupancy_grid_state: OccupancyGridState
     persistent_landmarks: list[PersistentLandmark]
     landmark_track_state: LandmarkTrackState
     true_trajectory_x: list[float]
@@ -374,7 +412,7 @@ class StepResult:
     frame_index: int
     observation_pose: np.ndarray
     lidar_scan: LidarScan
-    observed_landmarks: list[ScanMeasurement]
+    observed_landmarks: list[LandmarkObservation]
     landmark_track_count: int
     truth_observation_set: TruthObservationSet | None
     association_result: AssociationResult
@@ -492,6 +530,7 @@ def parse_config(raw_config: Mapping[str, Any]):
     motion = _require_mapping(raw["motion"], "motion")
     odometry_noise = _require_mapping(raw["odometry_noise"], "odometry_noise")
     voxel_grid = _require_mapping(raw["voxel_grid"], "voxel_grid")
+    occupancy_grid = _require_mapping(raw["occupancy_grid"], "occupancy_grid")
     agent = _require_mapping(raw["agent"], "agent")
     initial_pose = _require_mapping(agent["initial_pose"], "agent.initial_pose")
     startup_behavior = _require_mapping(agent["startup_behavior"], "agent.startup_behavior")
@@ -506,6 +545,29 @@ def parse_config(raw_config: Mapping[str, Any]):
     walls_raw = environment.get("walls", [])
     if not isinstance(walls_raw, Sequence) or isinstance(walls_raw, (str, bytes)):
         raise TypeError("environment.walls must be a sequence")
+
+    occupied_threshold = _require_float(occupancy_grid["occupied_threshold"], "occupancy_grid.occupied_threshold")
+    free_threshold = _require_float(occupancy_grid["free_threshold"], "occupancy_grid.free_threshold")
+    cell_size = _require_float(occupancy_grid["cell_size"], "occupancy_grid.cell_size")
+    occupancy_width = _require_float(occupancy_grid["width"], "occupancy_grid.width")
+    occupancy_height = _require_float(occupancy_grid["height"], "occupancy_grid.height")
+    log_odds_min = _require_float(occupancy_grid["log_odds_min"], "occupancy_grid.log_odds_min")
+    log_odds_max = _require_float(occupancy_grid["log_odds_max"], "occupancy_grid.log_odds_max")
+    ray_subsample = _require_int(occupancy_grid["ray_subsample"], "occupancy_grid.ray_subsample")
+    if cell_size <= 0.0:
+        raise ValueError("occupancy_grid.cell_size must be positive")
+    if occupancy_width <= 0.0 or occupancy_height <= 0.0:
+        raise ValueError("occupancy_grid.width and occupancy_grid.height must be positive")
+    if log_odds_min >= log_odds_max:
+        raise ValueError("occupancy_grid.log_odds_min must be smaller than occupancy_grid.log_odds_max")
+    if ray_subsample <= 0:
+        raise ValueError("occupancy_grid.ray_subsample must be positive")
+    if not (0.0 <= free_threshold <= 1.0):
+        raise ValueError("occupancy_grid.free_threshold must be in the interval [0, 1]")
+    if not (0.0 <= occupied_threshold <= 1.0):
+        raise ValueError("occupancy_grid.occupied_threshold must be in the interval [0, 1]")
+    if free_threshold >= occupied_threshold:
+        raise ValueError("occupancy_grid.free_threshold must be smaller than occupancy_grid.occupied_threshold")
 
     return AppConfig(
         simulation=SimulationConfig(
@@ -536,13 +598,20 @@ def parse_config(raw_config: Mapping[str, Any]):
             ),
         ),
         feature_extraction=FeatureExtractionConfig(
+            enable_corners=_require_bool(feature_extraction["enable_corners"], "feature_extraction.enable_corners"),
+            enable_line_segments=_require_bool(feature_extraction["enable_line_segments"], "feature_extraction.enable_line_segments"),
+            enable_endpoints=_require_bool(feature_extraction["enable_endpoints"], "feature_extraction.enable_endpoints"),
+            enable_junctions=_require_bool(feature_extraction["enable_junctions"], "feature_extraction.enable_junctions"),
             window_size=_require_int(feature_extraction["window_size"], "feature_extraction.window_size"),
+            line_min_points=_require_int(feature_extraction["line_min_points"], "feature_extraction.line_min_points"),
             max_neighbor_gap=_require_float(feature_extraction["max_neighbor_gap"], "feature_extraction.max_neighbor_gap"),
             min_segment_span=_require_float(feature_extraction["min_segment_span"], "feature_extraction.min_segment_span"),
             max_line_residual=_require_float(feature_extraction["max_line_residual"], "feature_extraction.max_line_residual"),
             min_corner_angle_deg=_require_float(feature_extraction["min_corner_angle_deg"], "feature_extraction.min_corner_angle_deg"),
             max_corner_angle_deg=_require_float(feature_extraction["max_corner_angle_deg"], "feature_extraction.max_corner_angle_deg"),
             nms_radius=_require_int(feature_extraction["nms_radius"], "feature_extraction.nms_radius"),
+            junction_merge_distance=_require_float(feature_extraction["junction_merge_distance"], "feature_extraction.junction_merge_distance"),
+            endpoint_merge_distance=_require_float(feature_extraction["endpoint_merge_distance"], "feature_extraction.endpoint_merge_distance"),
             persistence_frames=_require_int(feature_extraction["persistence_frames"], "feature_extraction.persistence_frames"),
             association_radius=_require_float(feature_extraction["association_radius"], "feature_extraction.association_radius"),
         ),
@@ -572,6 +641,21 @@ def parse_config(raw_config: Mapping[str, Any]):
             best_observation_override=_require_bool(voxel_grid["best_observation_override"], "voxel_grid.best_observation_override"),
             best_observation_max_distance=_require_float(voxel_grid["best_observation_max_distance"], "voxel_grid.best_observation_max_distance"),
         ),
+        occupancy_grid=OccupancyGridConfig(
+            enabled=_require_bool(occupancy_grid["enabled"], "occupancy_grid.enabled"),
+            cell_size=cell_size,
+            width=occupancy_width,
+            height=occupancy_height,
+            origin_x=_require_float(occupancy_grid["origin_x"], "occupancy_grid.origin_x"),
+            origin_y=_require_float(occupancy_grid["origin_y"], "occupancy_grid.origin_y"),
+            log_odds_hit=_require_float(occupancy_grid["log_odds_hit"], "occupancy_grid.log_odds_hit"),
+            log_odds_free=_require_float(occupancy_grid["log_odds_free"], "occupancy_grid.log_odds_free"),
+            log_odds_min=log_odds_min,
+            log_odds_max=log_odds_max,
+            occupied_threshold=occupied_threshold,
+            free_threshold=free_threshold,
+            ray_subsample=ray_subsample,
+        ),
         agent=AgentConfig(
             initial_pose=InitialPoseConfig(
                 x=_require_float(initial_pose["x"], "agent.initial_pose.x"),
@@ -591,6 +675,9 @@ def parse_config(raw_config: Mapping[str, Any]):
             ylim=_require_pair(plot["ylim"], "plot.ylim"),
             point_size=_require_float(plot["point_size"], "plot.point_size"),
             point_alpha=_require_float(plot["point_alpha"], "plot.point_alpha"),
+            show_point_cloud=_require_bool(plot["show_point_cloud"], "plot.show_point_cloud"),
+            show_voxel_grid=_require_bool(plot["show_voxel_grid"], "plot.show_voxel_grid"),
+            show_occupancy_grid=_require_bool(plot["show_occupancy_grid"], "plot.show_occupancy_grid"),
             show_ekf_overlay=_require_bool(plot["show_ekf_overlay"], "plot.show_ekf_overlay"),
             show_landmark_tracks=_require_bool(plot["show_landmark_tracks"], "plot.show_landmark_tracks"),
             track_color_mode=_require_choice(plot["track_color_mode"], "plot.track_color_mode", ("quality", "age", "augmented")),
@@ -728,7 +815,7 @@ def generate_environment(
     return walls
 
 
-def initialize_slam_state(initial_pose: InitialPoseConfig):
+def initialize_slam_state(initial_pose: InitialPoseConfig, occupancy_grid_config: OccupancyGridConfig):
     mu = np.array(
         [initial_pose.x, initial_pose.y, np.radians(initial_pose.theta_deg)],
         dtype=float,
@@ -744,6 +831,7 @@ def initialize_slam_state(initial_pose: InitialPoseConfig):
         voxel_points_x=[],
         voxel_points_y=[],
         voxel_state=defaultdict(VoxelCellState),
+        occupancy_grid_state=initialize_occupancy_grid(occupancy_grid_config),
         persistent_landmarks=[],
         landmark_track_state=initialize_landmark_track_state(),
         true_trajectory_x=[initial_pose.x],
@@ -779,7 +867,7 @@ def create_simulation(config: AppConfig | Mapping[str, Any]):
         walls=walls,
         truth_landmark_positions=extract_truth_landmark_positions(walls),
         agent_state=initialize_agent_state(config.agent.initial_pose, config.agent.startup_behavior),
-        slam_state=initialize_slam_state(config.agent.initial_pose),
+        slam_state=initialize_slam_state(config.agent.initial_pose, config.occupancy_grid),
     )
 
 
@@ -804,17 +892,32 @@ def build_truth_observations(state: SimulationState, observation_pose: np.ndarra
 
 
 def build_feature_observations(
-    observed_landmarks: Sequence[ScanMeasurement],
-    observed_landmark_points: Sequence[np.ndarray],
+    extracted_landmarks: Sequence[ExtractedLandmark],
+    observation_pose: np.ndarray,
 ):
     observations: list[LandmarkObservation] = []
-    for index, (measurement, world_point) in enumerate(zip(observed_landmarks, observed_landmark_points)):
+    for index, landmark in enumerate(extracted_landmarks):
+        local_position = np.asarray(landmark.local_position, dtype=float)
+        distance = float(np.linalg.norm(local_position))
+        bearing = float(np.arctan2(local_position[1], local_position[0]))
+        world_theta = float(observation_pose[2] + bearing)
+        world_point = np.array(
+            [
+                observation_pose[0] + distance * np.cos(world_theta),
+                observation_pose[1] + distance * np.sin(world_theta),
+            ],
+            dtype=float,
+        )
         observations.append(
             LandmarkObservation(
-                range=float(measurement.distance),
-                bearing=float(measurement.angle),
+                range=distance,
+                bearing=bearing,
                 world_position=np.array(world_point, dtype=float, copy=True),
                 source_id=index,
+                landmark_type=landmark.landmark_type,
+                orientation=landmark.orientation,
+                extent=landmark.extent,
+                confidence=landmark.confidence,
             )
         )
     return observations
@@ -836,9 +939,13 @@ def step_simulation(state: SimulationState):
     )
 
     slam_state = state.slam_state
-    observed_landmarks = extract_landmarks(lidar_scan.measurements, state.config.feature_extraction)
-    observed_landmark_points = measurements_to_world_points(observed_landmarks, observation_pose)
-    feature_observations = build_feature_observations(observed_landmarks, observed_landmark_points)
+    extracted_landmarks = extract_landmarks(lidar_scan.measurements, state.config.feature_extraction)
+    feature_observations = build_feature_observations(extracted_landmarks, observation_pose)
+    observed_landmark_points = [
+        np.array(observation.world_position, dtype=float, copy=True)
+        for observation in feature_observations
+        if observation.world_position is not None
+    ]
     association_result = associate_feature_observations(state, feature_observations)
     slam_state.persistent_landmarks = update_persistent_landmarks(
         observed_landmark_points,
@@ -847,6 +954,7 @@ def step_simulation(state: SimulationState):
     )
     track_update_result = update_landmark_track_state(
         observed_landmark_points,
+        feature_observations,
         association_result,
         slam_state.landmark_track_state,
         current_frame,
@@ -914,6 +1022,13 @@ def step_simulation(state: SimulationState):
     )
     slam_state.voxel_points_x[:] = averaged_x
     slam_state.voxel_points_y[:] = averaged_y
+    slam_state.occupancy_grid_state = update_occupancy_from_scan(
+        slam_state.mu,
+        lidar_scan.scan_samples,
+        slam_state.occupancy_grid_state,
+        state.config.sensor.max_range,
+        state.config.occupancy_grid,
+    )
 
     command = step_agent(
         state.agent_state,
@@ -950,7 +1065,7 @@ def step_simulation(state: SimulationState):
         frame_index=current_frame,
         observation_pose=observation_pose,
         lidar_scan=lidar_scan,
-        observed_landmarks=observed_landmarks,
+        observed_landmarks=feature_observations,
         landmark_track_count=len(slam_state.landmark_track_state.tracks),
         truth_observation_set=truth_observation_set,
         association_result=association_result,

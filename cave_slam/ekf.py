@@ -19,6 +19,7 @@ from .slam import (
     ekf_update_full_state,
     ekf_update_pose_only_batch_gated,
     get_landmark_state_index,
+    is_ekf_compatible_landmark_type,
     is_nis_accepted,
     is_track_ready_for_augmentation,
 )
@@ -113,6 +114,8 @@ def apply_full_slam_correction(
         if landmark_index is None:
             continue
         observation = feature_observations[match.observation_index]
+        if not is_ekf_compatible_landmark_type(observation.landmark_type):
+            continue
 
         update_result = ekf_update_full_state(
             state.slam_state.mu,
@@ -133,6 +136,9 @@ def apply_full_slam_correction(
             continue
         if assignment.observation_index >= len(feature_observations):
             continue
+        observation = feature_observations[assignment.observation_index]
+        if not is_ekf_compatible_landmark_type(observation.landmark_type):
+            continue
         track = state.slam_state.landmark_track_state.tracks.get(assignment.track_id)
         if track is None or not is_track_ready_for_augmentation(track, state.config.ekf.augmentation):
             continue
@@ -140,7 +146,7 @@ def apply_full_slam_correction(
         state.slam_state.mu, state.slam_state.Sigma = augment_state_with_landmark(
             state.slam_state.mu,
             state.slam_state.Sigma,
-            feature_observations[assignment.observation_index],
+            observation,
             state.config.ekf.measurement,
         )
         _register_augmented_landmark(state, assignment.track_id)
@@ -172,7 +178,13 @@ def apply_pose_only_ekf_correction(
         prioritized_matches = prioritize_association_matches(association_result)
         if not prioritized_matches:
             return [], 0
-        selected_matches = prioritized_matches[:max_updates]
+        selected_matches = [
+            match
+            for match in prioritized_matches
+            if is_ekf_compatible_landmark_type(feature_observations[match.observation_index].landmark_type)
+        ][:max_updates]
+        if not selected_matches:
+            return [], 0
         selected_observations = [feature_observations[match.observation_index] for match in selected_matches]
         selected_landmarks = extract_associated_track_positions(
             state.slam_state.landmark_track_state,
@@ -193,4 +205,3 @@ def apply_pose_only_ekf_correction(
     state.slam_state.mu = updated_mu
     state.slam_state.Sigma = updated_Sigma
     return update_results, rejected_count
-

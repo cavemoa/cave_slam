@@ -55,6 +55,7 @@ cave_slam/
 │   ├── __init__.py
 │   ├── agent.py
 │   ├── ekf.py
+│   ├── occupancy.py
 │   ├── sim.py
 │   ├── slam.py
 │   └── viz.py
@@ -67,6 +68,7 @@ cave_slam/
   - lidar ray casting and measurement generation
   - sensor noise model
   - landmark extraction from local scan geometry
+  - typed landmark observations and tracks
   - landmark track, association, and gating logic
   - point-cloud transformation
   - voxel-grid aggregation
@@ -84,6 +86,11 @@ cave_slam/
   - match prioritization for correction
   - pose-only EKF correction flow
   - full-SLAM correction and landmark augmentation flow
+
+- [cave_slam/occupancy.py](/home/jon/cave_slam/cave_slam/occupancy.py)
+  - log-odds occupancy grid state
+  - free-space ray carving
+  - occupancy-grid scan updates
 
 - [cave_slam/sim.py](/home/jon/cave_slam/cave_slam/sim.py)
   - typed configuration models and validation
@@ -192,7 +199,7 @@ At a high level, each animation frame follows this loop:
 5. The landmark track layer is updated and may create new landmark tracks.
 6. Depending on `ekf.mode`, the estimator performs either pose-only correction or full EKF-SLAM landmark augmentation and update.
 7. Measurements are transformed into world coordinates using the corrected observation-time EKF pose.
-8. The point cloud is accumulated and averaged into a voxel grid.
+8. The point cloud is accumulated, averaged into a voxel grid, and optionally fused into a log-odds occupancy grid.
 9. The agent controller chooses and applies a motion command.
 10. Odometry noise is added to the command.
 11. The EKF prediction step advances the estimator to the post-motion state.
@@ -228,12 +235,19 @@ The forward sector is also tracked so the controller can estimate how close an o
 
 ### Landmark Extraction
 
-The current feature extraction stage looks for corner-like structures in the ordered lidar returns. It does this by:
+The feature extraction stage now emits typed landmark observations from the ordered lidar returns. The current supported types are:
 
-- converting neighboring scan samples into local 2D points
-- fitting line directions to a small left and right window
-- checking span, continuity, residual error, and corner angle
-- applying non-maximum suppression to avoid dense duplicate detections
+- `corner`
+- `line_segment`
+- `endpoint`
+- `junction`
+
+The detector currently works in layers:
+
+- corners are detected from local left/right line fits around a candidate point
+- line segments are fit from contiguous scan chains with low line residual
+- endpoints are taken from segment ends that are not absorbed into a nearby junction
+- junctions are formed where nearby fitted line segments meet at a strong angle
 
 Detected landmarks are also passed into a separate landmark track layer used by the estimator. That track layer maintains:
 
@@ -242,6 +256,15 @@ Detected landmarks are also passed into a separate landmark track layer used by 
 - observation counts
 - last-seen frame tracking
 - track quality scores
+
+The landmark framework is now explicit rather than implicit. Both observations and tracks carry a `landmark_type`.
+
+For estimator behavior, there is still an important boundary:
+
+- `corner`, `endpoint`, and `junction` are treated as point-compatible features
+- `line_segment` is currently tracked and visualized, but kept external to the EKF state
+
+That keeps the current EKF measurement model stable while the feature model becomes richer.
 
 The old visual persistence layer is still used for display, but EKF association now works against the dedicated track layer rather than the display-only landmark list.
 
@@ -267,6 +290,18 @@ In practice this means:
 - long-range early observations do not dominate forever
 - short-range observations can progressively refine the same cell
 - the displayed voxel point can either be the weighted fused centroid or, for close confident hits, a sharper best-observation position
+
+## Occupancy Grid
+
+The simulation now also includes a headless log-odds occupancy grid in [cave_slam/occupancy.py](/home/jon/cave_slam/cave_slam/occupancy.py).
+
+This grid is updated from the full lidar scan after EKF correction and before motion prediction, using the corrected observation-time estimate. Each ray:
+
+- carves free space through cells traversed by the beam
+- increases occupancy for the endpoint cell when the ray hits an obstacle
+- leaves max-range rays as free-space evidence only
+
+The occupancy grid is also available as a live plot overlay in the interactive viewer. Occupied cells appear dark, carved free space appears light, and low-evidence unknown regions remain faint.
 
 The two weighting modes behave as follows:
 
@@ -438,8 +473,18 @@ The sensor noise grows with distance.
 
 ### `feature_extraction`
 
+- `enable_corners`
+  - enable or disable corner extraction
+- `enable_line_segments`
+  - enable or disable fitted line-segment landmarks
+- `enable_endpoints`
+  - enable or disable endpoint landmarks derived from fitted segments
+- `enable_junctions`
+  - enable or disable junction landmarks derived from nearby segment joins
 - `window_size`
   - number of neighboring points used on each side of a candidate feature
+- `line_min_points`
+  - minimum number of scan hits required to fit a line segment
 - `max_neighbor_gap`
   - maximum allowed gap between neighboring scan points
 - `min_segment_span`
@@ -452,6 +497,10 @@ The sensor noise grows with distance.
   - maximum allowed corner angle
 - `nms_radius`
   - non-maximum suppression radius in scan index space
+- `junction_merge_distance`
+  - maximum local-space distance for combining nearby segment ends into a junction
+- `endpoint_merge_distance`
+  - de-duplication distance used for endpoint and junction landmark pruning
 - `persistence_frames`
   - lifetime of landmarks once detected
 - `association_radius`
@@ -518,6 +567,29 @@ Recommended tuning guidance:
 - use `inverse_variance` if you want the voxel map to track the lidar noise model
 - use `inverse_distance` if you want a simpler and more aggressive preference for nearby hits
 - lower `min_points_per_voxel` if you want voxels to appear earlier in a run
+
+### `occupancy_grid`
+
+- `enabled`
+  - enable or disable occupancy-grid updates
+- `cell_size`
+  - occupancy-grid resolution in world units
+- `width`, `height`
+  - total physical size covered by the occupancy grid
+- `origin_x`, `origin_y`
+  - world-space origin of the grid's lower-left corner
+- `log_odds_hit`
+  - positive log-odds increment for an occupied endpoint cell
+- `log_odds_free`
+  - negative log-odds increment for cells traversed by a ray
+- `log_odds_min`, `log_odds_max`
+  - clipping bounds for occupancy confidence
+- `occupied_threshold`
+  - probability threshold used to classify a cell as occupied
+- `free_threshold`
+  - probability threshold used to classify a cell as free
+- `ray_subsample`
+  - update every Nth lidar ray to trade fidelity for speed
 - lower `temporal_decay` if you want the map to refine more quickly after the robot moves closer to a surface
 - reduce `best_observation_max_distance` if the override is too eager
 
@@ -553,6 +625,12 @@ Recommended tuning guidance:
   - raw point cloud marker size
 - `point_alpha`
   - raw point cloud transparency
+- `show_point_cloud`
+  - show or hide the raw accumulated point cloud
+- `show_voxel_grid`
+  - show or hide the voxel-grid overlay
+- `show_occupancy_grid`
+  - show or hide the occupancy-grid overlay
 - `show_ekf_overlay`
   - show or hide the live EKF diagnostics text overlay during the simulation
 - `show_landmark_tracks`
@@ -645,6 +723,10 @@ The visualization currently shows:
 - black line segments for walls
 - blue points for the raw accumulated point cloud
 - orange points for the voxel-grid map
+- a grayscale occupancy-grid overlay
+  - dark cells indicate occupied space
+  - light cells indicate carved free space
+  - faint cells indicate low-evidence unknown space
 - red outlined circles for detected persistent landmarks
 - colored points for landmark tracks
   - color can represent track quality, age, or whether the track has been augmented into the EKF state
@@ -687,7 +769,7 @@ More recently, plotting was separated again into [cave_slam/viz.py](/home/jon/ca
 ## Known Limitations
 
 - The estimator is still an educational EKF-SLAM implementation rather than a production-grade SLAM backend.
-- The current landmark model uses extracted corner-like scan features and simple track management, so association quality depends heavily on scan geometry and tuning.
+- The current landmark model uses heuristic scan-derived `corner`, `line_segment`, `endpoint`, and `junction` features with simple track management, so association quality still depends heavily on scan geometry and tuning.
 - `full_slam` currently augments landmarks into the EKF state, but it does not yet implement landmark removal, merging, or loop-closure machinery.
 - The simulation loop is optimized for experimentation and visualization rather than textbook robotics middleware timing.
 - The map is an accumulated visualization, not a globally optimized back-end map.

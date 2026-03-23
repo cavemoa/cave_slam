@@ -200,6 +200,13 @@ Its purpose is to provide:
 
 The track layer is updated from extracted scan features.
 
+The landmark model is now explicit rather than implicit. Observations and tracks both carry a `landmark_type`, and the active pipeline can now emit `corner`, `line_segment`, `endpoint`, and `junction` landmarks.
+
+For estimator stability, there is still a boundary:
+
+- `corner`, `endpoint`, and `junction` are treated as point-compatible EKF features
+- `line_segment` is currently kept external to the EKF state and used only in the typed track layer
+
 It currently supports:
 
 - track creation
@@ -356,7 +363,7 @@ At a high level, each simulation step currently does the following:
 1. Copy the current true observation pose.
 2. Optionally build truth-harness observations.
 3. Simulate lidar.
-4. Extract corner-like landmarks from the scan.
+4. Extract typed landmarks from the scan.
 5. Build feature observations in range-bearing and world-point form.
 6. Associate feature observations against the track layer.
 7. Update the visual landmark layer.
@@ -566,7 +573,7 @@ If the map grows too quickly in `full_slam` mode:
 
 The EKF implementation is now substantially more capable than the original prediction-only version, but several limitations remain.
 
-- Landmark extraction is still based on simple corner-like scan geometry.
+- Landmark extraction is still heuristic and currently derives all feature types directly from local scan geometry.
 - The track layer does not yet support merge or split logic.
 - Augmented landmarks are not currently removed from the EKF state.
 - There is no loop-closure system or smoothing back-end.
