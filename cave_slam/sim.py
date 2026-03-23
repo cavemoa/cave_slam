@@ -10,8 +10,12 @@ import numpy as np
 import yaml
 
 from .agent import AgentState, MotionCommand, initialize_agent_state, step_agent
+from .ekf import (
+    apply_full_slam_correction,
+    apply_pose_only_ekf_correction,
+    associate_feature_observations,
+)
 from .slam import (
-    AssociationMatch,
     AssociationResult,
     EkfDebugInfo,
     EkfSlamStateIndex,
@@ -25,28 +29,18 @@ from .slam import (
     TruthObservationSet,
     VoxelCellState,
     WallSegment,
-    association_confidence_key,
-    associate_landmarks_mahalanobis,
-    associate_landmarks_nearest_neighbor,
-    augment_state_with_landmark,
     build_ekf_step_diagnostics,
     compute_ekf_debug_info,
     ekf_predict,
-    ekf_update_full_state,
-    ekf_update_pose_only_batch_gated,
     extract_landmarks,
     extract_truth_landmark_positions,
-    get_landmark_state_index,
     initialize_ekf_slam_state_index,
     initialize_landmark_track_state,
-    is_track_ready_for_augmentation,
-    is_nis_accepted,
     measurements_to_world_points,
     simulate_lidar,
     simulate_landmark_observations_from_truth,
     sync_landmark_tracks_with_state,
     transform_measurements,
-    TrackUpdateResult,
     update_landmark_track_state,
     update_persistent_landmarks,
     update_voxel_grid,
@@ -818,174 +812,6 @@ def build_feature_observations(
             )
         )
     return observations
-
-
-def associate_feature_observations(
-    state: SimulationState,
-    feature_observations: Sequence[LandmarkObservation],
-):
-    association_config = state.config.ekf.association
-    track_state = state.slam_state.landmark_track_state
-    if association_config.method == "nearest_neighbor":
-        return associate_landmarks_nearest_neighbor(
-            feature_observations,
-            track_state,
-            max_distance=association_config.max_distance,
-            min_track_quality=association_config.min_track_quality,
-            ambiguity_ratio_threshold=association_config.ambiguity_ratio_threshold,
-            ambiguity_margin_threshold=association_config.ambiguity_margin_threshold,
-            mu=state.slam_state.mu,
-            state_index=state.slam_state.ekf_slam_index,
-        )
-
-    return associate_landmarks_mahalanobis(
-        feature_observations,
-        track_state,
-        state.slam_state.mu,
-        state.slam_state.Sigma,
-        state.config.ekf.measurement,
-        max_distance=association_config.max_distance,
-        mahalanobis_threshold=association_config.mahalanobis_threshold,
-        min_track_quality=association_config.min_track_quality,
-        ambiguity_ratio_threshold=association_config.ambiguity_ratio_threshold,
-        ambiguity_margin_threshold=association_config.ambiguity_margin_threshold,
-        state_index=state.slam_state.ekf_slam_index,
-    )
-
-
-def extract_associated_track_positions(
-    track_state: LandmarkTrackState,
-    matches: Sequence[AssociationMatch],
-):
-    associated_positions: list[np.ndarray] = []
-    for match in matches:
-        track = track_state.tracks.get(match.track_id)
-        if track is None:
-            continue
-        associated_positions.append(np.array(track.position, dtype=float, copy=True))
-    return associated_positions
-
-
-def prioritize_association_matches(association_result: AssociationResult):
-    return tuple(
-        sorted(
-            association_result.matched,
-            key=lambda match: association_confidence_key(match, association_result.method),
-        )
-    )
-
-
-def _register_augmented_landmark(state: SimulationState, track_id: int):
-    landmark_index = len(state.slam_state.mu) - 2
-    state.slam_state.ekf_slam_index.track_id_to_index[track_id] = landmark_index
-    if track_id not in state.slam_state.ekf_slam_index.state_track_ids:
-        state.slam_state.ekf_slam_index.state_track_ids.append(track_id)
-    return landmark_index
-
-
-def apply_full_slam_correction(
-    state: SimulationState,
-    feature_observations: Sequence[LandmarkObservation],
-    association_result: AssociationResult,
-    track_update_result: TrackUpdateResult,
-):
-    pose_update_config = state.config.ekf.pose_update
-    if not pose_update_config.enabled:
-        return [], (), 0
-
-    max_updates = max(0, pose_update_config.max_updates_per_frame)
-    if max_updates == 0:
-        return [], (), 0
-    update_results: list[EkfUpdateResult] = []
-    augmented_track_ids: list[int] = []
-    rejected_count = 0
-
-    prioritized_matches = prioritize_association_matches(association_result)
-    for match in prioritized_matches[:max_updates]:
-        landmark_index = get_landmark_state_index(state.slam_state.ekf_slam_index, match.track_id)
-        if landmark_index is None:
-            continue
-        observation = feature_observations[match.observation_index]
-
-        update_result = ekf_update_full_state(
-            state.slam_state.mu,
-            state.slam_state.Sigma,
-            observation,
-            landmark_index,
-            state.config.ekf.measurement,
-        )
-        if not is_nis_accepted(update_result.nis, pose_update_config.nis_threshold):
-            rejected_count += 1
-            continue
-        state.slam_state.mu = update_result.mu
-        state.slam_state.Sigma = update_result.Sigma
-        update_results.append(update_result)
-
-    for assignment in track_update_result.assignments:
-        if get_landmark_state_index(state.slam_state.ekf_slam_index, assignment.track_id) is not None:
-            continue
-        if assignment.observation_index >= len(feature_observations):
-            continue
-        track = state.slam_state.landmark_track_state.tracks.get(assignment.track_id)
-        if track is None or not is_track_ready_for_augmentation(track, state.config.ekf.augmentation):
-            continue
-
-        state.slam_state.mu, state.slam_state.Sigma = augment_state_with_landmark(
-            state.slam_state.mu,
-            state.slam_state.Sigma,
-            feature_observations[assignment.observation_index],
-            state.config.ekf.measurement,
-        )
-        _register_augmented_landmark(state, assignment.track_id)
-        augmented_track_ids.append(assignment.track_id)
-
-    return update_results, tuple(augmented_track_ids), rejected_count
-
-
-def apply_pose_only_ekf_correction(
-    state: SimulationState,
-    truth_observation_set: TruthObservationSet | None,
-    feature_observations: Sequence[LandmarkObservation],
-    association_result: AssociationResult,
-):
-    pose_update_config = state.config.ekf.pose_update
-    if not pose_update_config.enabled:
-        return [], 0
-
-    max_updates = max(0, pose_update_config.max_updates_per_frame)
-    if max_updates == 0:
-        return [], 0
-
-    if pose_update_config.use_truth_observations:
-        if truth_observation_set is None:
-            return [], 0
-        selected_observations = truth_observation_set.observations[:max_updates]
-        selected_landmarks = truth_observation_set.landmark_positions[:max_updates]
-    else:
-        prioritized_matches = prioritize_association_matches(association_result)
-        if not prioritized_matches:
-            return [], 0
-        selected_matches = prioritized_matches[:max_updates]
-        selected_observations = [feature_observations[match.observation_index] for match in selected_matches]
-        selected_landmarks = extract_associated_track_positions(
-            state.slam_state.landmark_track_state,
-            selected_matches,
-        )
-
-    if not selected_observations or len(selected_observations) != len(selected_landmarks):
-        return [], 0
-
-    updated_mu, updated_Sigma, update_results, rejected_count = ekf_update_pose_only_batch_gated(
-        state.slam_state.mu,
-        state.slam_state.Sigma,
-        selected_observations,
-        selected_landmarks,
-        state.config.ekf.measurement,
-        pose_update_config.nis_threshold,
-    )
-    state.slam_state.mu = updated_mu
-    state.slam_state.Sigma = updated_Sigma
-    return update_results, rejected_count
 
 
 def step_simulation(state: SimulationState):

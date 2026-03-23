@@ -18,6 +18,7 @@ The estimator in this project is a lightweight educational EKF implementation fo
 The current implementation lives mainly in:
 
 - `cave_slam/slam.py`
+- `cave_slam/ekf.py`
 - `cave_slam/sim.py`
 - `cave_slam/viz.py`
 
@@ -189,7 +190,7 @@ This mode is useful when:
 
 ## Landmark Track Layer
 
-The landmark track layer is implemented in `cave_slam/slam.py` and orchestrated from `cave_slam/sim.py`.
+The landmark track layer is implemented in `cave_slam/slam.py` and orchestrated from `cave_slam/ekf.py`.
 
 Its purpose is to provide:
 
@@ -212,7 +213,7 @@ The last point matters in `full_slam` mode. Once a track has been inserted into 
 
 ## Data Association
 
-Association is implemented in `cave_slam/slam.py` and called from `associate_feature_observations(...)` in `cave_slam/sim.py`.
+Association is implemented in `cave_slam/slam.py` and called from `associate_feature_observations(...)` in `cave_slam/ekf.py`.
 
 Two association modes are supported:
 
@@ -348,7 +349,7 @@ In `full_slam`, landmarks become part of the joint estimated state.
 
 ## How `step_simulation()` Uses The EKF
 
-The estimator orchestration happens in `cave_slam/sim.py`.
+The estimator orchestration now happens mainly in `cave_slam/ekf.py`, while `cave_slam/sim.py` coordinates the larger simulation frame.
 
 At a high level, each simulation step currently does the following:
 

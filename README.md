@@ -54,6 +54,7 @@ cave_slam/
 ├── cave_slam/
 │   ├── __init__.py
 │   ├── agent.py
+│   ├── ekf.py
 │   ├── sim.py
 │   ├── slam.py
 │   └── viz.py
@@ -69,7 +70,7 @@ cave_slam/
   - landmark track, association, and gating logic
   - point-cloud transformation
   - voxel-grid aggregation
-  - EKF prediction, pose-only correction, and full-state augmentation math
+  - EKF prediction and low-level estimator math
 
 - [cave_slam/agent.py](/home/jon/cave_slam/cave_slam/agent.py)
   - agent motion state
@@ -78,12 +79,18 @@ cave_slam/
   - startup spin behavior
   - movement stepping
 
+- [cave_slam/ekf.py](/home/jon/cave_slam/cave_slam/ekf.py)
+  - feature-observation association orchestration
+  - match prioritization for correction
+  - pose-only EKF correction flow
+  - full-SLAM correction and landmark augmentation flow
+
 - [cave_slam/sim.py](/home/jon/cave_slam/cave_slam/sim.py)
   - typed configuration models and validation
   - procedural environment generation
   - runtime state containers
   - headless simulation stepping
-  - simulation orchestration without plotting concerns
+  - top-level `observe -> update -> map -> move -> predict` coordination without plotting concerns
 
 - [cave_slam/viz.py](/home/jon/cave_slam/cave_slam/viz.py)
   - Matplotlib backend setup
@@ -659,7 +666,7 @@ This project intentionally keeps the math and simulation logic exposed in plain 
 - quick prototyping
 - experimenting with controller and sensor settings
 
-The refactor into `slam.py`, `agent.py`, and `sim.py` was done to reduce complexity in the main runner and make future iteration safer.
+The refactor into `slam.py`, `agent.py`, `sim.py`, and now `ekf.py` was done to reduce complexity in the main runner and make future iteration safer.
 
 More recently, plotting was separated again into [cave_slam/viz.py](/home/jon/cave_slam/cave_slam/viz.py), and configuration/state were converted into typed dataclasses. The result is a package that is easier to:
 
