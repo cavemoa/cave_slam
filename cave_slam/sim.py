@@ -31,12 +31,13 @@ from .slam import (
     compute_ekf_debug_info,
     ekf_predict,
     ekf_update_full_state,
-    ekf_update_pose_only_batch,
+    ekf_update_pose_only_batch_gated,
     extract_landmarks,
     extract_truth_landmark_positions,
     get_landmark_state_index,
     initialize_ekf_slam_state_index,
     initialize_landmark_track_state,
+    is_nis_accepted,
     measurements_to_world_points,
     simulate_lidar,
     simulate_landmark_observations_from_truth,
@@ -153,6 +154,7 @@ DEFAULT_CONFIG = {
             "enabled": False,
             "use_truth_observations": True,
             "max_updates_per_frame": 8,
+            "nis_threshold": 50.0,
         },
         "association": {
             "method": "mahalanobis",
@@ -297,6 +299,7 @@ class PoseUpdateConfig:
     enabled: bool
     use_truth_observations: bool
     max_updates_per_frame: int
+    nis_threshold: float
 
 
 @dataclass(frozen=True)
@@ -586,6 +589,7 @@ def parse_config(raw_config: Mapping[str, Any]):
                 enabled=_require_bool(ekf_pose_update["enabled"], "ekf.pose_update.enabled"),
                 use_truth_observations=_require_bool(ekf_pose_update["use_truth_observations"], "ekf.pose_update.use_truth_observations"),
                 max_updates_per_frame=_require_int(ekf_pose_update["max_updates_per_frame"], "ekf.pose_update.max_updates_per_frame"),
+                nis_threshold=_require_float(ekf_pose_update["nis_threshold"], "ekf.pose_update.nis_threshold"),
             ),
             association=AssociationConfig(
                 method=_require_choice(ekf_association["method"], "ekf.association.method", ("nearest_neighbor", "mahalanobis")),
@@ -840,13 +844,14 @@ def apply_full_slam_correction(
 ):
     pose_update_config = state.config.ekf.pose_update
     if not pose_update_config.enabled:
-        return [], ()
+        return [], (), 0
 
     max_updates = max(0, pose_update_config.max_updates_per_frame)
     if max_updates == 0:
-        return [], ()
+        return [], (), 0
     update_results: list[EkfUpdateResult] = []
     augmented_track_ids: list[int] = []
+    rejected_count = 0
 
     for match in association_result.matched[:max_updates]:
         landmark_index = get_landmark_state_index(state.slam_state.ekf_slam_index, match.track_id)
@@ -870,6 +875,9 @@ def apply_full_slam_correction(
             landmark_index,
             state.config.ekf.measurement,
         )
+        if not is_nis_accepted(update_result.nis, pose_update_config.nis_threshold):
+            rejected_count += 1
+            continue
         state.slam_state.mu = update_result.mu
         state.slam_state.Sigma = update_result.Sigma
         update_results.append(update_result)
@@ -891,7 +899,7 @@ def apply_full_slam_correction(
         _register_augmented_landmark(state, assignment.track_id)
         augmented_track_ids.append(assignment.track_id)
 
-    return update_results, tuple(augmented_track_ids)
+    return update_results, tuple(augmented_track_ids), rejected_count
 
 
 def apply_pose_only_ekf_correction(
@@ -903,37 +911,38 @@ def apply_pose_only_ekf_correction(
 ):
     pose_update_config = state.config.ekf.pose_update
     if not pose_update_config.enabled:
-        return []
+        return [], 0
 
     max_updates = max(0, pose_update_config.max_updates_per_frame)
     if max_updates == 0:
-        return []
+        return [], 0
 
     if pose_update_config.use_truth_observations:
         if truth_observation_set is None:
-            return []
+            return [], 0
         selected_observations = truth_observation_set.observations[:max_updates]
         selected_landmarks = truth_observation_set.landmark_positions[:max_updates]
     else:
         if not association_result.matched:
-            return []
+            return [], 0
         selected_matches = association_result.matched[:max_updates]
         selected_observations = [feature_observations[match.observation_index] for match in selected_matches]
         selected_landmarks = list(associated_track_positions[: len(selected_matches)])
 
     if not selected_observations:
-        return []
+        return [], 0
 
-    updated_mu, updated_Sigma, update_results = ekf_update_pose_only_batch(
+    updated_mu, updated_Sigma, update_results, rejected_count = ekf_update_pose_only_batch_gated(
         state.slam_state.mu,
         state.slam_state.Sigma,
         selected_observations,
         selected_landmarks,
         state.config.ekf.measurement,
+        pose_update_config.nis_threshold,
     )
     state.slam_state.mu = updated_mu
     state.slam_state.Sigma = updated_Sigma
-    return update_results
+    return update_results, rejected_count
 
 
 def step_simulation(state: SimulationState):
@@ -1015,14 +1024,14 @@ def step_simulation(state: SimulationState):
     pre_update_sigma = slam_state.Sigma.copy()
     augmented_landmark_track_ids: tuple[int, ...] = ()
     if state.config.ekf.mode == "full_slam":
-        pose_update_results, augmented_landmark_track_ids = apply_full_slam_correction(
+        pose_update_results, augmented_landmark_track_ids, nis_rejection_count = apply_full_slam_correction(
             state,
             feature_observations,
             association_result,
             track_update_result,
         )
         num_candidate_observations = len(feature_observations)
-        num_rejections = len(association_result.rejected)
+        num_rejections = len(association_result.rejected) + nis_rejection_count
         slam_state.landmark_track_state = sync_landmark_tracks_with_state(
             slam_state.landmark_track_state,
             slam_state.ekf_slam_index,
@@ -1030,7 +1039,7 @@ def step_simulation(state: SimulationState):
             slam_state.Sigma,
         )
     else:
-        pose_update_results = apply_pose_only_ekf_correction(
+        pose_update_results, nis_rejection_count = apply_pose_only_ekf_correction(
             state,
             truth_observation_set,
             feature_observations,
@@ -1039,10 +1048,10 @@ def step_simulation(state: SimulationState):
         )
         if state.config.ekf.pose_update.use_truth_observations:
             num_candidate_observations = len(truth_observation_set.observations) if truth_observation_set is not None else 0
-            num_rejections = 0
+            num_rejections = nis_rejection_count
         else:
             num_candidate_observations = len(feature_observations)
-            num_rejections = len(association_result.rejected)
+            num_rejections = len(association_result.rejected) + nis_rejection_count
     ekf_diagnostics = build_ekf_step_diagnostics(
         pose_before_update=pre_update_mu,
         pose_after_update=slam_state.mu,

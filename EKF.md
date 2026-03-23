@@ -430,6 +430,28 @@ The EKF-related config currently includes:
 - `enabled`
 - `use_truth_observations`
 - `max_updates_per_frame`
+- `nis_threshold`
+
+`nis_threshold` controls NIS-based outlier rejection at the EKF correction stage.
+
+In practical terms:
+
+- if a candidate update produces `NIS <= nis_threshold`
+  - the update is accepted
+- if a candidate update produces `NIS > nis_threshold`
+  - the update is rejected and the EKF state is left unchanged for that observation
+
+This gate is applied:
+
+- in `pose_only` correction
+- in full-state landmark updates for `full_slam`
+
+It is not the same thing as association gating:
+
+- association gating decides whether an observation matches a track
+- NIS gating decides whether the matched observation should actually be allowed to update the filter
+
+The default threshold in this project is intentionally more permissive than a strict textbook chi-square threshold, because the current simulation loop is still an experimental observe/move/update pipeline rather than a perfectly clean predict-then-observe estimator timing model.
 
 In `full_slam` mode, the correction path uses associated track observations rather than the truth harness.
 

@@ -223,6 +223,12 @@ def build_innovation_stats(update_results: Sequence[EkfUpdateResult]):
     )
 
 
+def is_nis_accepted(nis: float, nis_threshold: float | None):
+    if nis_threshold is None:
+        return True
+    return float(nis) <= float(nis_threshold)
+
+
 def build_ekf_step_diagnostics(
     pose_before_update: np.ndarray,
     pose_after_update: np.ndarray,
@@ -555,6 +561,41 @@ def ekf_update_pose_only_batch(
         update_results.append(update_result)
 
     return updated_mu, updated_Sigma, update_results
+
+
+def ekf_update_pose_only_batch_gated(
+    mu: np.ndarray,
+    Sigma: np.ndarray,
+    observations: Sequence[LandmarkObservation],
+    landmark_positions: Sequence[np.ndarray],
+    measurement_config: MeasurementModelConfig,
+    nis_threshold: float | None,
+):
+    if len(observations) != len(landmark_positions):
+        raise ValueError("Observations and landmark_positions must have the same length.")
+
+    updated_mu = np.array(mu, dtype=float, copy=True)
+    updated_Sigma = np.array(Sigma, dtype=float, copy=True)
+    update_results: list[EkfUpdateResult] = []
+    rejected_count = 0
+
+    for observation, landmark_position in zip(observations, landmark_positions):
+        update_result = ekf_update_pose_only(
+            updated_mu,
+            updated_Sigma,
+            observation,
+            landmark_position,
+            measurement_config,
+        )
+        if not is_nis_accepted(update_result.nis, nis_threshold):
+            rejected_count += 1
+            continue
+
+        updated_mu = update_result.mu
+        updated_Sigma = update_result.Sigma
+        update_results.append(update_result)
+
+    return updated_mu, updated_Sigma, update_results, rejected_count
 
 
 def predict_landmark_from_observation(mu_pose: np.ndarray, observation: LandmarkObservation):

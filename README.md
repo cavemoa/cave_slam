@@ -574,6 +574,11 @@ Recommended tuning guidance:
   - `full_slam` mode uses associated landmark tracks regardless
 - `max_updates_per_frame`
   - maximum number of correction updates applied per frame
+- `nis_threshold`
+  - normalized innovation squared threshold used to reject outlier EKF updates
+  - larger values are more permissive
+  - smaller values reject more updates
+  - the default is intentionally fairly loose because the current simulation timing model is not a textbook predict-then-observe pipeline
 
 ### `ekf.association`
 
