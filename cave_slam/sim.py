@@ -45,6 +45,7 @@ from .slam import (
     update_landmark_track_state,
     update_persistent_landmarks,
     update_voxel_grid,
+    visible_landmark_tracks,
 )
 
 if TYPE_CHECKING:
@@ -160,9 +161,12 @@ DEFAULT_CONFIG = {
         "show_point_cloud": True,
         "show_voxel_grid": True,
         "show_occupancy_grid": True,
+        "show_detected_landmarks": True,
         "show_ekf_overlay": True,
         "show_landmark_tracks": True,
         "track_color_mode": "quality",
+        "min_visible_track_observations": 2,
+        "min_visible_track_quality": 0.3,
     },
     "ekf": {
         "mode": "pose_only",
@@ -329,9 +333,12 @@ class PlotConfig:
     show_point_cloud: bool
     show_voxel_grid: bool
     show_occupancy_grid: bool
+    show_detected_landmarks: bool
     show_ekf_overlay: bool
     show_landmark_tracks: bool
     track_color_mode: str
+    min_visible_track_observations: int
+    min_visible_track_quality: float
 
 
 @dataclass(frozen=True)
@@ -598,6 +605,18 @@ def parse_config(raw_config: Mapping[str, Any]):
         raise ValueError("ekf.association.line_orientation_threshold_deg must be positive")
     if line_extent_ratio_threshold < 0.0:
         raise ValueError("ekf.association.line_extent_ratio_threshold must be non-negative")
+    min_visible_track_observations = _require_int(
+        plot["min_visible_track_observations"],
+        "plot.min_visible_track_observations",
+    )
+    min_visible_track_quality = _require_float(
+        plot["min_visible_track_quality"],
+        "plot.min_visible_track_quality",
+    )
+    if min_visible_track_observations < 1:
+        raise ValueError("plot.min_visible_track_observations must be at least 1")
+    if min_visible_track_quality < 0.0:
+        raise ValueError("plot.min_visible_track_quality must be non-negative")
 
     corner_noise_scale = _require_float(ekf_measurement["corner_noise_scale"], "ekf.measurement.corner_noise_scale")
     endpoint_noise_scale = _require_float(ekf_measurement["endpoint_noise_scale"], "ekf.measurement.endpoint_noise_scale")
@@ -726,9 +745,12 @@ def parse_config(raw_config: Mapping[str, Any]):
             show_point_cloud=_require_bool(plot["show_point_cloud"], "plot.show_point_cloud"),
             show_voxel_grid=_require_bool(plot["show_voxel_grid"], "plot.show_voxel_grid"),
             show_occupancy_grid=_require_bool(plot["show_occupancy_grid"], "plot.show_occupancy_grid"),
+            show_detected_landmarks=_require_bool(plot["show_detected_landmarks"], "plot.show_detected_landmarks"),
             show_ekf_overlay=_require_bool(plot["show_ekf_overlay"], "plot.show_ekf_overlay"),
             show_landmark_tracks=_require_bool(plot["show_landmark_tracks"], "plot.show_landmark_tracks"),
-            track_color_mode=_require_choice(plot["track_color_mode"], "plot.track_color_mode", ("quality", "age", "augmented")),
+            track_color_mode=_require_choice(plot["track_color_mode"], "plot.track_color_mode", ("quality", "age", "augmented", "type")),
+            min_visible_track_observations=min_visible_track_observations,
+            min_visible_track_quality=min_visible_track_quality,
         ),
         ekf=EkfConfig(
             mode=_require_choice(ekf["mode"], "ekf.mode", ("pose_only", "full_slam")),
@@ -1136,7 +1158,13 @@ def step_simulation(state: SimulationState):
         observation_pose=observation_pose,
         lidar_scan=lidar_scan,
         observed_landmarks=feature_observations,
-        landmark_track_count=len(slam_state.landmark_track_state.tracks),
+        landmark_track_count=len(
+            visible_landmark_tracks(
+                slam_state.landmark_track_state,
+                state.config.plot.min_visible_track_observations,
+                state.config.plot.min_visible_track_quality,
+            )
+        ),
         truth_observation_set=truth_observation_set,
         association_result=association_result,
         motion_command=command,

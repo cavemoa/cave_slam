@@ -638,6 +638,8 @@ Recommended tuning guidance:
   - show or hide the voxel-grid overlay
 - `show_occupancy_grid`
   - show or hide the occupancy-grid overlay
+- `show_detected_landmarks`
+  - show or hide the red detected-landmark markers
 - `show_ekf_overlay`
   - show or hide the live EKF diagnostics text overlay during the simulation
 - `show_landmark_tracks`
@@ -647,6 +649,16 @@ Recommended tuning guidance:
   - `quality` colors by track confidence
   - `age` colors by frames since last seen
   - `augmented` highlights tracks that are already in the EKF state
+  - `type` colors tracks by landmark type and expands the legend to show the type colors
+- `min_visible_track_observations`
+  - hides provisional tracks from the plot and from the reported track count until they have been seen this many times
+- `min_visible_track_quality`
+  - alternative quality threshold that allows a strong track to become visible before it reaches the observation-count threshold
+
+These visibility thresholds do not remove tracks from the internal estimator state. They only affect:
+
+- landmark-track display in the live plot
+- the reported track count in the EKF diagnostics overlay
 
 ### `ekf`
 

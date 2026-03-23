@@ -409,6 +409,29 @@ def type_aware_track_quality(track: LandmarkTrack):
     return float(base_quality)
 
 
+def is_track_visible(
+    track: LandmarkTrack,
+    min_observations: int,
+    min_quality: float,
+):
+    return (
+        track.observation_count >= min_observations
+        or type_aware_track_quality(track) >= min_quality
+    )
+
+
+def visible_landmark_tracks(
+    track_state: LandmarkTrackState,
+    min_observations: int,
+    min_quality: float,
+):
+    return [
+        track
+        for track in track_state.tracks.values()
+        if is_track_visible(track, min_observations, min_quality)
+    ]
+
+
 def typed_track_quality(track: LandmarkTrack):
     return float(track.quality_score * np.clip(track.type_confidence, 0.0, 1.0))
 

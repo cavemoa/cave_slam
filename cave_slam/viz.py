@@ -7,7 +7,7 @@ from typing import Mapping
 
 import numpy as np
 
-from .slam import track_display_value
+from .slam import track_display_value, visible_landmark_tracks
 from .sim import AppConfig, SimulationState, create_simulation, step_simulation
 
 
@@ -28,6 +28,14 @@ class PlotArtists:
     ekf_heading: object
     ekf_text: object
     status_text: object
+
+
+TRACK_TYPE_COLORS = {
+    "corner": (0.12, 0.47, 0.71, 0.95),
+    "endpoint": (0.17, 0.63, 0.17, 0.95),
+    "junction": (0.84, 0.15, 0.16, 0.95),
+    "line_segment": (0.58, 0.40, 0.74, 0.95),
+}
 
 
 def configure_matplotlib_backend():
@@ -116,11 +124,20 @@ def _build_ekf_diagnostics_text(state: SimulationState):
 def _track_colors(state: SimulationState):
     import matplotlib.pyplot as plt
 
-    tracks = list(state.slam_state.landmark_track_state.tracks.values())
+    tracks = visible_landmark_tracks(
+        state.slam_state.landmark_track_state,
+        state.config.plot.min_visible_track_observations,
+        state.config.plot.min_visible_track_quality,
+    )
     if not tracks:
         return np.empty((0, 4))
 
     mode = state.config.plot.track_color_mode
+    if mode == "type":
+        return np.array(
+            [TRACK_TYPE_COLORS.get(track.landmark_type, (0.45, 0.45, 0.45, 0.8)) for track in tracks],
+            dtype=float,
+        )
     if mode == "augmented":
         return np.array(
             [
@@ -146,6 +163,46 @@ def _track_colors(state: SimulationState):
         normalized = np.clip(values / max_value, 0.0, 1.0)
         cmap = plt.get_cmap("plasma_r")
     return np.asarray(cmap(normalized), dtype=float)
+
+
+def _apply_legend(ax, state: SimulationState):
+    handles, labels = ax.get_legend_handles_labels()
+    if not (state.config.plot.show_landmark_tracks and state.config.plot.track_color_mode == "type"):
+        ax.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=4, frameon=False)
+        return
+
+    from matplotlib.lines import Line2D
+
+    filtered_handles = []
+    filtered_labels = []
+    for handle, label in zip(handles, labels):
+        if label == "Landmark Tracks":
+            continue
+        filtered_handles.append(handle)
+        filtered_labels.append(label)
+
+    type_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="",
+            markerfacecolor=color,
+            markeredgecolor="black",
+            markeredgewidth=0.5,
+            markersize=7,
+            label=f"{landmark_type.replace('_', ' ').title()} Track",
+        )
+        for landmark_type, color in TRACK_TYPE_COLORS.items()
+    ]
+    ax.legend(
+        filtered_handles + type_handles,
+        filtered_labels + [handle.get_label() for handle in type_handles],
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.16),
+        ncol=4,
+        frameon=False,
+    )
 
 
 def _build_occupancy_rgba(state: SimulationState):
@@ -218,6 +275,7 @@ def create_plot(state: SimulationState):
     track_scatter = ax.scatter([], [], s=40, linewidths=0.5, edgecolors="black", alpha=0.95, label="Landmark Tracks", zorder=4)
     scatter_cloud.set_visible(state.config.plot.show_point_cloud)
     voxel_scatter.set_visible(state.config.plot.show_voxel_grid)
+    landmark_scatter.set_visible(state.config.plot.show_detected_landmarks)
     track_scatter.set_visible(state.config.plot.show_landmark_tracks)
 
     true_traj_line, = ax.plot([], [], "g--", alpha=0.8, label="True Trajectory")
@@ -239,7 +297,7 @@ def create_plot(state: SimulationState):
     )
     ekf_text.set_visible(state.config.plot.show_ekf_overlay)
 
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=4, frameon=False)
+    _apply_legend(ax, state)
     status_text = fig.text(0.5, 0.04, _build_status_text(state), ha="center", va="center")
     plt.tight_layout(rect=(0, 0.12, 1, 1))
 
@@ -298,12 +356,15 @@ def render_simulation(state: SimulationState):
         artists.landmark_scatter.set_offsets(np.empty((0, 2)))
         artists.landmark_scatter.set_edgecolors(np.empty((0, 4)))
         artists.landmark_scatter.set_facecolors(np.empty((0, 4)))
+    artists.landmark_scatter.set_visible(state.config.plot.show_detected_landmarks)
 
     if state.config.plot.show_landmark_tracks:
-        track_positions = np.array(
-            [track.position for track in slam_state.landmark_track_state.tracks.values()],
-            dtype=float,
+        visible_tracks = visible_landmark_tracks(
+            slam_state.landmark_track_state,
+            state.config.plot.min_visible_track_observations,
+            state.config.plot.min_visible_track_quality,
         )
+        track_positions = np.array([track.position for track in visible_tracks], dtype=float)
         artists.track_scatter.set_offsets(track_positions if len(track_positions) else np.empty((0, 2)))
         artists.track_scatter.set_facecolors(_track_colors(state))
         artists.track_scatter.set_visible(True)
