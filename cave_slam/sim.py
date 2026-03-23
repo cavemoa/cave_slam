@@ -11,6 +11,7 @@ import yaml
 
 from .agent import AgentState, MotionCommand, initialize_agent_state, step_agent
 from .slam import (
+    AssociationMatch,
     AssociationResult,
     EkfDebugInfo,
     EkfSlamStateIndex,
@@ -24,6 +25,7 @@ from .slam import (
     TruthObservationSet,
     VoxelCellState,
     WallSegment,
+    association_confidence_key,
     associate_landmarks_mahalanobis,
     associate_landmarks_nearest_neighbor,
     augment_state_with_landmark,
@@ -138,6 +140,7 @@ DEFAULT_CONFIG = {
         "ylim": [-1, 16],
         "point_size": 10,
         "point_alpha": 0.08,
+        "show_ekf_overlay": True,
     },
     "ekf": {
         "mode": "pose_only",
@@ -285,6 +288,7 @@ class PlotConfig:
     ylim: tuple[float, float]
     point_size: float
     point_alpha: float
+    show_ekf_overlay: bool
 
 
 @dataclass(frozen=True)
@@ -589,6 +593,7 @@ def parse_config(raw_config: Mapping[str, Any]):
             ylim=_require_pair(plot["ylim"], "plot.ylim"),
             point_size=_require_float(plot["point_size"], "plot.point_size"),
             point_alpha=_require_float(plot["point_alpha"], "plot.point_alpha"),
+            show_ekf_overlay=_require_bool(plot["show_ekf_overlay"], "plot.show_ekf_overlay"),
         ),
         ekf=EkfConfig(
             mode=_require_choice(ekf["mode"], "ekf.mode", ("pose_only", "full_slam")),
@@ -850,15 +855,24 @@ def associate_feature_observations(
 
 def extract_associated_track_positions(
     track_state: LandmarkTrackState,
-    association_result: AssociationResult,
+    matches: Sequence[AssociationMatch],
 ):
     associated_positions: list[np.ndarray] = []
-    for match in association_result.matched:
+    for match in matches:
         track = track_state.tracks.get(match.track_id)
         if track is None:
             continue
         associated_positions.append(np.array(track.position, dtype=float, copy=True))
     return associated_positions
+
+
+def prioritize_association_matches(association_result: AssociationResult):
+    return tuple(
+        sorted(
+            association_result.matched,
+            key=lambda match: association_confidence_key(match, association_result.method),
+        )
+    )
 
 
 def _register_augmented_landmark(state: SimulationState, track_id: int):
@@ -886,7 +900,8 @@ def apply_full_slam_correction(
     augmented_track_ids: list[int] = []
     rejected_count = 0
 
-    for match in association_result.matched[:max_updates]:
+    prioritized_matches = prioritize_association_matches(association_result)
+    for match in prioritized_matches[:max_updates]:
         landmark_index = get_landmark_state_index(state.slam_state.ekf_slam_index, match.track_id)
         if landmark_index is None:
             continue
@@ -932,7 +947,6 @@ def apply_pose_only_ekf_correction(
     truth_observation_set: TruthObservationSet | None,
     feature_observations: Sequence[LandmarkObservation],
     association_result: AssociationResult,
-    associated_track_positions: Sequence[np.ndarray],
 ):
     pose_update_config = state.config.ekf.pose_update
     if not pose_update_config.enabled:
@@ -948,13 +962,17 @@ def apply_pose_only_ekf_correction(
         selected_observations = truth_observation_set.observations[:max_updates]
         selected_landmarks = truth_observation_set.landmark_positions[:max_updates]
     else:
-        if not association_result.matched:
+        prioritized_matches = prioritize_association_matches(association_result)
+        if not prioritized_matches:
             return [], 0
-        selected_matches = association_result.matched[:max_updates]
+        selected_matches = prioritized_matches[:max_updates]
         selected_observations = [feature_observations[match.observation_index] for match in selected_matches]
-        selected_landmarks = list(associated_track_positions[: len(selected_matches)])
+        selected_landmarks = extract_associated_track_positions(
+            state.slam_state.landmark_track_state,
+            selected_matches,
+        )
 
-    if not selected_observations:
+    if not selected_observations or len(selected_observations) != len(selected_landmarks):
         return [], 0
 
     updated_mu, updated_Sigma, update_results, rejected_count = ekf_update_pose_only_batch_gated(
@@ -990,7 +1008,6 @@ def step_simulation(state: SimulationState):
     observed_landmark_points = measurements_to_world_points(observed_landmarks, observation_pose)
     feature_observations = build_feature_observations(observed_landmarks, observed_landmark_points)
     association_result = associate_feature_observations(state, feature_observations)
-    associated_track_positions = extract_associated_track_positions(slam_state.landmark_track_state, association_result)
     slam_state.persistent_landmarks = update_persistent_landmarks(
         observed_landmark_points,
         slam_state.persistent_landmarks,
@@ -1030,7 +1047,6 @@ def step_simulation(state: SimulationState):
             truth_observation_set,
             feature_observations,
             association_result,
-            associated_track_positions,
         )
         if state.config.ekf.pose_update.use_truth_observations:
             num_candidate_observations = len(truth_observation_set.observations) if truth_observation_set is not None else 0

@@ -144,6 +144,7 @@ def create_plot(state: SimulationState):
         family="monospace",
         bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.6"},
     )
+    ekf_text.set_visible(state.config.plot.show_ekf_overlay)
 
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=4, frameon=False)
     status_text = fig.text(0.5, 0.04, _build_status_text(state), ha="center", va="center")
@@ -213,7 +214,8 @@ def render_simulation(state: SimulationState):
         [slam_state.mu[0], slam_state.mu[0] + heading_length * np.cos(slam_state.mu[2])],
         [slam_state.mu[1], slam_state.mu[1] + heading_length * np.sin(slam_state.mu[2])],
     )
-    artists.ekf_text.set_text(_build_ekf_diagnostics_text(state))
+    if state.config.plot.show_ekf_overlay:
+        artists.ekf_text.set_text(_build_ekf_diagnostics_text(state))
     pause_suffix = " [Paused]" if state.is_paused else ""
     artists.status_text.set_text(_build_status_text(state) + pause_suffix)
 

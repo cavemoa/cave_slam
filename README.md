@@ -1,5 +1,8 @@
 # Cave SLAM
 
+<img src="images/cave_slam_logo.JPG" width="25%">
+
+
 `Cave SLAM` is a small 2D simulation project for exploring SLAM-related ideas in a visually inspectable way. It combines:
 
 - procedural cave-like environment generation
@@ -305,6 +308,7 @@ The key EKF features currently implemented are:
 - landmark track layer with stable track IDs
 - nearest-neighbor and Mahalanobis association modes
 - ambiguity rejection for near-tied association candidates
+- confidence-sorted correction updates, so the strongest matches are applied first
 - pose-only EKF correction
 - delayed landmark initialization for `full_slam`
 - full EKF-SLAM state augmentation and full-state landmark updates
@@ -542,6 +546,8 @@ Recommended tuning guidance:
   - raw point cloud marker size
 - `point_alpha`
   - raw point cloud transparency
+- `show_ekf_overlay`
+  - show or hide the live EKF diagnostics text overlay during the simulation
 
 ### `ekf`
 
@@ -615,6 +621,8 @@ These ambiguity checks apply before correction and are separate from:
 
 - Mahalanobis gating
 - NIS-based update rejection
+
+Ambiguous feature observations are also kept out of the landmark-track update path, so a near-tied association does not quietly become a new external track and later get augmented into `full_slam`.
 
 ## Outputs and Visual Elements
 

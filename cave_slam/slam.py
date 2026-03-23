@@ -353,6 +353,12 @@ def _build_empty_association_result(method: str, gating_applied: bool):
     )
 
 
+def association_confidence_key(match: AssociationMatch, method: str):
+    if method == "mahalanobis":
+        return float(match.mahalanobis_distance)
+    return float(match.distance)
+
+
 def is_association_ambiguous(
     best_score: float,
     second_best_score: float | None,
@@ -1133,6 +1139,7 @@ def update_landmark_track_state(
     prune_landmark_tracks(track_state, frame_index, protected_track_ids)
     assignments: list[TrackAssignment] = []
     matched_observation_indices: set[int] = set()
+    ambiguous_observation_indices = {candidate.observation_index for candidate in association_result.ambiguous}
     used_track_ids: set[int] = set()
 
     for match in association_result.matched:
@@ -1147,7 +1154,7 @@ def update_landmark_track_state(
         used_track_ids.add(track.track_id)
 
     for observation_index, point in enumerate(world_points):
-        if observation_index in matched_observation_indices:
+        if observation_index in matched_observation_indices or observation_index in ambiguous_observation_indices:
             continue
 
         point_array = np.asarray(point, dtype=float)

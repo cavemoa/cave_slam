@@ -265,6 +265,8 @@ For Mahalanobis association, the score is Mahalanobis distance.
 
 If either test indicates that the top two candidates are too close, the observation is treated as unmatched and counted as an ambiguous rejection rather than a normal matched update.
 
+Ambiguous observations are not fed into the landmark-track update path either. That prevents a weakly distinguished feature from quietly creating or refreshing an external track which could later be augmented into the EKF state.
+
 ### Association Output
 
 Association returns an `AssociationResult` containing:
@@ -370,6 +372,13 @@ At a high level, each simulation step currently does the following:
 This is now an explicit `observe -> update -> map -> move -> predict` timing model.
 
 That is more internally consistent for this simulation than the earlier pattern where observations came from the pre-motion pose but correction happened only after prediction.
+
+When multiple matched observations are available in a frame, the correction stage now processes them in confidence order:
+
+- Mahalanobis association: lowest Mahalanobis distance first
+- nearest-neighbor association: lowest Euclidean distance first
+
+That makes the limited `max_updates_per_frame` budget more useful and reduces the influence of weaker matches.
 
 ## How Full-SLAM Correction Works In Practice
 
