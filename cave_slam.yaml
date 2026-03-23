@@ -52,6 +52,21 @@ voxel_grid:
   point_alpha: 0.9
   color: darkorange
 
+occupancy_grid:
+  enabled: true
+  cell_size: 0.2
+  width: 17.0
+  height: 17.0
+  origin_x: -1.0
+  origin_y: -1.0
+  log_odds_hit: 0.85
+  log_odds_free: 0.4
+  log_odds_min: -4.0
+  log_odds_max: 4.0
+  occupied_threshold: 0.65
+  free_threshold: 0.35
+  ray_subsample: 1
+
 agent:
   initial_pose:
     x: 2.0
@@ -69,6 +84,9 @@ plot:
   ylim: [-1, 16]
   point_size: 10
   point_alpha: 0.08
+  show_point_cloud: false   # Show or hide the raw accumulated point cloud
+  show_voxel_grid: false   # Show or hide the voxel-grid overlay
+  show_occupancy_grid: true   # Show or hide the occupancy-grid overlay
   show_ekf_overlay: false   # Show or hide the live EKF diagnostics text overlay
   show_landmark_tracks: true   # Show or hide the landmark-track overlay
   track_color_mode: quality   # Track coloring: quality, age, or augmented
