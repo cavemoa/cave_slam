@@ -342,12 +342,40 @@ def range_bearing_jacobian_pose(mu: np.ndarray, landmark_position: np.ndarray):
     )
 
 
-def measurement_noise_matrix(config: MeasurementModelConfig):
+def landmark_type_priority(landmark_type: LandmarkType):
+    priority_order = {
+        "junction": 0,
+        "endpoint": 1,
+        "corner": 2,
+        "line_segment": 3,
+    }
+    return priority_order.get(landmark_type, 99)
+
+
+def measurement_noise_scale(
+    config: MeasurementModelConfig,
+    observation: LandmarkObservation | None = None,
+):
+    if observation is None:
+        return 1.0
+
+    if observation.landmark_type == "endpoint":
+        return float(config.endpoint_noise_scale)
+    if observation.landmark_type == "junction":
+        return float(config.junction_noise_scale)
+    return float(config.corner_noise_scale)
+
+
+def measurement_noise_matrix(
+    config: MeasurementModelConfig,
+    observation: LandmarkObservation | None = None,
+):
     if config.model_type != "range_bearing":
         raise ValueError(f"Unsupported measurement model type: {config.model_type}")
 
-    range_variance = config.range_std ** 2
-    bearing_variance = np.radians(config.bearing_std_deg) ** 2
+    noise_scale = measurement_noise_scale(config, observation)
+    range_variance = (config.range_std * noise_scale) ** 2
+    bearing_variance = (np.radians(config.bearing_std_deg) * noise_scale) ** 2
     return np.array([[range_variance, 0.0], [0.0, bearing_variance]], dtype=float)
 
 
@@ -370,6 +398,15 @@ def can_associate_landmark_types(
 
 def is_ekf_compatible_landmark_type(landmark_type: LandmarkType):
     return landmark_type in {"corner", "endpoint", "junction"}
+
+
+def type_aware_track_quality(track: LandmarkTrack):
+    base_quality = typed_track_quality(track)
+    if track.landmark_type == "junction":
+        return float(base_quality * 1.15)
+    if track.landmark_type == "endpoint":
+        return float(base_quality * 1.05)
+    return float(base_quality)
 
 
 def typed_track_quality(track: LandmarkTrack):
@@ -655,7 +692,7 @@ def associate_landmarks_mahalanobis(
                 H[:, :3] = range_bearing_jacobian_pose(mu, landmark_position)
             else:
                 H = range_bearing_jacobian_full_state(mu, landmark_index)
-            R = measurement_noise_matrix(measurement_config)
+            R = measurement_noise_matrix(measurement_config, observation)
             innovation_covariance = H @ Sigma @ H.T + R
             mahalanobis_distance = compute_mahalanobis_distance(innovation, innovation_covariance)
 
@@ -728,7 +765,7 @@ def ekf_update_pose_only(
     z = observation_to_measurement_vector(observation)
     z_hat = predict_range_bearing(mu, landmark_position)
     H = range_bearing_jacobian_pose(mu, landmark_position)
-    R = measurement_noise_matrix(measurement_config)
+    R = measurement_noise_matrix(measurement_config, observation)
 
     innovation = innovation_range_bearing(z, z_hat)
     S = H @ Sigma @ H.T + R
@@ -879,7 +916,7 @@ def augment_state_with_landmark(
         dtype=float,
     )
 
-    R = measurement_noise_matrix(measurement_config)
+    R = measurement_noise_matrix(measurement_config, observation)
     state_size = len(mu)
     augmented_mu = np.concatenate([np.asarray(mu, dtype=float), landmark_position])
 
@@ -908,7 +945,7 @@ def ekf_update_full_state(
     z = observation_to_measurement_vector(observation)
     z_hat = predict_range_bearing(mu, landmark_position)
     H = range_bearing_jacobian_full_state(mu, landmark_index)
-    R = measurement_noise_matrix(measurement_config)
+    R = measurement_noise_matrix(measurement_config, observation)
 
     innovation = innovation_range_bearing(z, z_hat)
     S = H @ Sigma @ H.T + R
@@ -1438,9 +1475,19 @@ def track_display_value(
 
 
 def is_track_ready_for_augmentation(track: LandmarkTrack, augmentation_config: AugmentationConfig):
+    min_observations = augmentation_config.min_observations
+    min_track_quality = augmentation_config.min_track_quality
+
+    if track.landmark_type == "endpoint":
+        min_observations = augmentation_config.endpoint_min_observations
+        min_track_quality = augmentation_config.endpoint_min_track_quality
+    elif track.landmark_type == "junction":
+        min_observations = augmentation_config.junction_min_observations
+        min_track_quality = augmentation_config.junction_min_track_quality
+
     return (
-        track.observation_count >= augmentation_config.min_observations
-        or track.quality_score >= augmentation_config.min_track_quality
+        track.observation_count >= min_observations
+        or typed_track_quality(track) >= min_track_quality
     )
 
 

@@ -264,7 +264,12 @@ For estimator behavior, there is still an important boundary:
 - `corner`, `endpoint`, and `junction` are treated as point-compatible features
 - `line_segment` is currently tracked and visualized, but kept external to the EKF state
 
-That keeps the current EKF measurement model stable while the feature model becomes richer.
+That keeps the current EKF measurement model stable while the feature model becomes richer. Within that point-compatible set, the EKF is now type-aware:
+
+- `junction` features are preferred first for correction and augmentation
+- `endpoint` features are preferred next
+- `corner` features remain valid, but are treated as the least-structured point landmarks
+- measurement noise can be scaled by landmark type so `endpoint` and `junction` features can be trusted slightly more than generic corners
 
 The old visual persistence layer is still used for display, but EKF association now works against the dedicated track layer rather than the display-only landmark list.
 
@@ -351,8 +356,10 @@ The key EKF features currently implemented are:
 - nearest-neighbor and Mahalanobis association modes
 - ambiguity rejection for near-tied association candidates
 - confidence-sorted correction updates, so the strongest matches are applied first
+- type-aware EKF correction ordering, so `junction` and `endpoint` matches are used before generic corners when update budget is limited
 - pose-only EKF correction
 - delayed landmark initialization for `full_slam`
+- type-aware delayed augmentation, so `endpoint` and `junction` tracks can use their own stability thresholds before entering the EKF state
 - full EKF-SLAM state augmentation and full-state landmark updates
 - per-step EKF diagnostics and live overlay text
 
@@ -656,6 +663,21 @@ Recommended tuning guidance:
   - measurement standard deviation for range
 - `bearing_std_deg`
   - measurement standard deviation for bearing in degrees
+- `corner_noise_scale`
+  - multiplicative EKF measurement-noise scale for corner landmarks
+- `endpoint_noise_scale`
+  - multiplicative EKF measurement-noise scale for endpoint landmarks
+  - values below `1.0` make endpoint updates more trusted than generic corners
+- `junction_noise_scale`
+  - multiplicative EKF measurement-noise scale for junction landmarks
+  - values below `1.0` make junction updates more trusted than generic corners
+
+These scales are used in:
+
+- Mahalanobis association
+- pose-only EKF correction
+- full-state EKF correction
+- landmark augmentation covariance initialization
 
 ### `ekf.truth_update`
 
@@ -688,11 +710,25 @@ Recommended tuning guidance:
   - minimum number of observations before an external landmark track can be promoted into the `full_slam` state
 - `min_track_quality`
   - alternative quality threshold that also allows promotion into the `full_slam` state
+- `endpoint_min_observations`
+  - endpoint-specific observation threshold for promotion into the `full_slam` state
+- `endpoint_min_track_quality`
+  - endpoint-specific quality threshold for promotion
+- `junction_min_observations`
+  - junction-specific observation threshold for promotion
+- `junction_min_track_quality`
+  - junction-specific quality threshold for promotion
 
 In `full_slam` mode, a new landmark is no longer augmented on first sighting. It stays external in the track layer until either:
 
 - it has been seen enough times, or
 - its track quality is high enough
+
+The thresholds are now type-aware:
+
+- `corner` tracks use the base `min_observations` and `min_track_quality`
+- `endpoint` tracks use the endpoint-specific thresholds
+- `junction` tracks use the junction-specific thresholds
 
 ### `ekf.association`
 

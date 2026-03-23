@@ -170,6 +170,9 @@ DEFAULT_CONFIG = {
             "model_type": "range_bearing",
             "range_std": 0.05,
             "bearing_std_deg": 2.0,
+            "corner_noise_scale": 1.0,
+            "endpoint_noise_scale": 0.85,
+            "junction_noise_scale": 0.75,
         },
         "truth_update": {
             "enabled": False,
@@ -195,6 +198,10 @@ DEFAULT_CONFIG = {
         "augmentation": {
             "min_observations": 3,
             "min_track_quality": 0.6,
+            "endpoint_min_observations": 2,
+            "endpoint_min_track_quality": 0.5,
+            "junction_min_observations": 2,
+            "junction_min_track_quality": 0.45,
         },
     },
 }
@@ -332,6 +339,9 @@ class MeasurementModelConfig:
     model_type: str
     range_std: float
     bearing_std_deg: float
+    corner_noise_scale: float
+    endpoint_noise_scale: float
+    junction_noise_scale: float
 
 
 @dataclass(frozen=True)
@@ -365,6 +375,10 @@ class AssociationConfig:
 class AugmentationConfig:
     min_observations: int
     min_track_quality: float
+    endpoint_min_observations: int
+    endpoint_min_track_quality: float
+    junction_min_observations: int
+    junction_min_track_quality: float
 
 
 @dataclass(frozen=True)
@@ -585,6 +599,24 @@ def parse_config(raw_config: Mapping[str, Any]):
     if line_extent_ratio_threshold < 0.0:
         raise ValueError("ekf.association.line_extent_ratio_threshold must be non-negative")
 
+    corner_noise_scale = _require_float(ekf_measurement["corner_noise_scale"], "ekf.measurement.corner_noise_scale")
+    endpoint_noise_scale = _require_float(ekf_measurement["endpoint_noise_scale"], "ekf.measurement.endpoint_noise_scale")
+    junction_noise_scale = _require_float(ekf_measurement["junction_noise_scale"], "ekf.measurement.junction_noise_scale")
+    for scale_value, scale_name in (
+        (corner_noise_scale, "ekf.measurement.corner_noise_scale"),
+        (endpoint_noise_scale, "ekf.measurement.endpoint_noise_scale"),
+        (junction_noise_scale, "ekf.measurement.junction_noise_scale"),
+    ):
+        if scale_value <= 0.0:
+            raise ValueError(f"{scale_name} must be positive")
+    for count_value, count_name in (
+        (_require_int(ekf_augmentation["min_observations"], "ekf.augmentation.min_observations"), "ekf.augmentation.min_observations"),
+        (_require_int(ekf_augmentation["endpoint_min_observations"], "ekf.augmentation.endpoint_min_observations"), "ekf.augmentation.endpoint_min_observations"),
+        (_require_int(ekf_augmentation["junction_min_observations"], "ekf.augmentation.junction_min_observations"), "ekf.augmentation.junction_min_observations"),
+    ):
+        if count_value < 1:
+            raise ValueError(f"{count_name} must be at least 1")
+
     return AppConfig(
         simulation=SimulationConfig(
             delay_ms=_require_int(simulation["delay_ms"], "simulation.delay_ms"),
@@ -704,6 +736,9 @@ def parse_config(raw_config: Mapping[str, Any]):
                 model_type=_require_choice(ekf_measurement["model_type"], "ekf.measurement.model_type", ("range_bearing",)),
                 range_std=_require_float(ekf_measurement["range_std"], "ekf.measurement.range_std"),
                 bearing_std_deg=_require_float(ekf_measurement["bearing_std_deg"], "ekf.measurement.bearing_std_deg"),
+                corner_noise_scale=corner_noise_scale,
+                endpoint_noise_scale=endpoint_noise_scale,
+                junction_noise_scale=junction_noise_scale,
             ),
             truth_update=TruthUpdateConfig(
                 enabled=_require_bool(ekf_truth_update["enabled"], "ekf.truth_update.enabled"),
@@ -738,6 +773,22 @@ def parse_config(raw_config: Mapping[str, Any]):
             augmentation=AugmentationConfig(
                 min_observations=_require_int(ekf_augmentation["min_observations"], "ekf.augmentation.min_observations"),
                 min_track_quality=_require_float(ekf_augmentation["min_track_quality"], "ekf.augmentation.min_track_quality"),
+                endpoint_min_observations=_require_int(
+                    ekf_augmentation["endpoint_min_observations"],
+                    "ekf.augmentation.endpoint_min_observations",
+                ),
+                endpoint_min_track_quality=_require_float(
+                    ekf_augmentation["endpoint_min_track_quality"],
+                    "ekf.augmentation.endpoint_min_track_quality",
+                ),
+                junction_min_observations=_require_int(
+                    ekf_augmentation["junction_min_observations"],
+                    "ekf.augmentation.junction_min_observations",
+                ),
+                junction_min_track_quality=_require_float(
+                    ekf_augmentation["junction_min_track_quality"],
+                    "ekf.augmentation.junction_min_track_quality",
+                ),
             ),
         ),
     )

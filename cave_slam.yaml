@@ -100,6 +100,10 @@ plot:
 
 ekf:
   mode: full_slam   # Use pose_only or full_slam to enable EKF state augmentation with landmarks
+  measurement:
+    corner_noise_scale: 1.0   # Baseline EKF measurement noise scale for generic corner landmarks
+    endpoint_noise_scale: 0.85   # Lower values make endpoint updates slightly more trusted than corners
+    junction_noise_scale: 0.75   # Lower values make junction updates slightly more trusted than corners
   pose_update:
     nis_threshold: 50.0   # Reject EKF correction updates whose normalized innovation is too large
   association:
@@ -108,3 +112,7 @@ ekf:
   augmentation:
     min_observations: 3   # Do not augment a landmark into full_slam state until it has been seen enough times
     min_track_quality: 0.6   # Alternatively allow augmentation once the track quality is high enough
+    endpoint_min_observations: 2   # Endpoint tracks can enter the EKF sooner because they are usually sharper than corners
+    endpoint_min_track_quality: 0.5   # Endpoint quality threshold for early augmentation
+    junction_min_observations: 2   # Junction tracks can also enter the EKF sooner when consistently observed
+    junction_min_track_quality: 0.45   # Junction quality threshold for early augmentation

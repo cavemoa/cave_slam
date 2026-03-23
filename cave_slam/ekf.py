@@ -22,6 +22,8 @@ from .slam import (
     is_ekf_compatible_landmark_type,
     is_nis_accepted,
     is_track_ready_for_augmentation,
+    landmark_type_priority,
+    type_aware_track_quality,
 )
 
 if TYPE_CHECKING:
@@ -76,11 +78,37 @@ def extract_associated_track_positions(
     return associated_positions
 
 
-def prioritize_association_matches(association_result: AssociationResult):
+def prioritize_association_matches(
+    association_result: AssociationResult,
+    observations: Sequence[LandmarkObservation],
+):
     return tuple(
         sorted(
             association_result.matched,
-            key=lambda match: association_confidence_key(match, association_result.method),
+            key=lambda match: (
+                landmark_type_priority(observations[match.observation_index].landmark_type),
+                association_confidence_key(match, association_result.method),
+                -float(np.clip(observations[match.observation_index].confidence, 0.0, 1.0)),
+            ),
+        )
+    )
+
+
+def prioritize_track_assignments(
+    assignments: Sequence,
+    track_state: LandmarkTrackState,
+    observations: Sequence[LandmarkObservation],
+):
+    return tuple(
+        sorted(
+            assignments,
+            key=lambda assignment: (
+                landmark_type_priority(observations[assignment.observation_index].landmark_type),
+                -type_aware_track_quality(track_state.tracks[assignment.track_id]),
+                -track_state.tracks[assignment.track_id].observation_count,
+            )
+            if assignment.track_id in track_state.tracks and assignment.observation_index < len(observations)
+            else (99, float("inf"), float("inf")),
         )
     )
 
@@ -110,7 +138,7 @@ def apply_full_slam_correction(
     augmented_track_ids: list[int] = []
     rejected_count = 0
 
-    prioritized_matches = prioritize_association_matches(association_result)
+    prioritized_matches = prioritize_association_matches(association_result, feature_observations)
     for match in prioritized_matches[:max_updates]:
         landmark_index = get_landmark_state_index(state.slam_state.ekf_slam_index, match.track_id)
         if landmark_index is None:
@@ -133,7 +161,12 @@ def apply_full_slam_correction(
         state.slam_state.Sigma = update_result.Sigma
         update_results.append(update_result)
 
-    for assignment in track_update_result.assignments:
+    prioritized_assignments = prioritize_track_assignments(
+        track_update_result.assignments,
+        state.slam_state.landmark_track_state,
+        feature_observations,
+    )
+    for assignment in prioritized_assignments:
         if get_landmark_state_index(state.slam_state.ekf_slam_index, assignment.track_id) is not None:
             continue
         if assignment.observation_index >= len(feature_observations):
@@ -177,7 +210,7 @@ def apply_pose_only_ekf_correction(
         selected_observations = truth_observation_set.observations[:max_updates]
         selected_landmarks = truth_observation_set.landmark_positions[:max_updates]
     else:
-        prioritized_matches = prioritize_association_matches(association_result)
+        prioritized_matches = prioritize_association_matches(association_result, feature_observations)
         if not prioritized_matches:
             return [], 0
         selected_matches = [

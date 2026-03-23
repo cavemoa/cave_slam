@@ -207,6 +207,13 @@ For estimator stability, there is still a boundary:
 - `corner`, `endpoint`, and `junction` are treated as point-compatible EKF features
 - `line_segment` is currently kept external to the EKF state and used only in the typed track layer
 
+`Stage H: Type-Aware EKF` builds on that boundary rather than removing it. The current estimator still uses a point landmark model for `corner`, `endpoint`, and `junction`, but it no longer treats those three types identically:
+
+- `junction` observations are prioritized first for EKF correction and augmentation
+- `endpoint` observations are prioritized next
+- `corner` observations remain valid but are treated as the least-structured point features
+- measurement noise is scaled by landmark type, so endpoints and junctions can be given tighter effective noise than corners
+
 The typed track layer is now also type-aware in its matching rules:
 
 - `corner`, `endpoint`, and `junction` use point-style spatial association
@@ -256,6 +263,12 @@ If a landmark is already augmented into the EKF state, the full-state measuremen
 This means Mahalanobis association naturally gets more informative once landmarks have entered the EKF state.
 
 For `line_segment` tracks, Mahalanobis association still uses midpoint range-bearing residuals only after the line has passed the type-aware orientation and extent gates. Line segments remain external to the EKF state in the current implementation.
+
+Because Mahalanobis association uses the EKF measurement noise matrix, the new type-aware measurement scaling also affects the association score:
+
+- `junction` tracks can produce tighter innovations than corners
+- `endpoint` tracks can also be weighted slightly more strongly than corners
+- `line_segment` tracks still remain external and are never augmented into the EKF state
 
 ### Ambiguity Rejection
 
@@ -324,6 +337,16 @@ When a landmark is first inserted into the EKF state:
 2. The state vector is extended by two elements.
 3. The covariance matrix is enlarged.
 4. Cross-covariances between robot pose and landmark are initialized from the pose covariance and measurement noise.
+
+The augmentation path is now type-aware in two ways:
+
+1. Candidate tracks are considered in landmark-type priority order:
+   - `junction`
+   - `endpoint`
+   - `corner`
+2. The landmark measurement noise used in covariance initialization is scaled by landmark type.
+
+That means well-formed endpoint and junction tracks can both enter the EKF earlier and be initialized with slightly tighter uncertainty than generic corners, if the config is tuned that way.
 
 ### Landmark Initialization
 
@@ -490,6 +513,18 @@ The EKF-related config currently includes:
 - `model_type`
 - `range_std`
 - `bearing_std_deg`
+- `corner_noise_scale`
+- `endpoint_noise_scale`
+- `junction_noise_scale`
+
+The scale fields are multiplicative factors applied to both the base range and base bearing standard deviations when the observation type is `corner`, `endpoint`, or `junction`.
+
+This type-aware measurement noise is used in:
+
+- Mahalanobis association
+- pose-only correction
+- full-state correction
+- state augmentation covariance initialization
 
 ### `ekf.truth_update`
 
@@ -547,10 +582,22 @@ This is separate from:
 
 - `min_observations`
 - `min_track_quality`
+- `endpoint_min_observations`
+- `endpoint_min_track_quality`
+- `junction_min_observations`
+- `junction_min_track_quality`
 
 These settings control delayed landmark initialization for `full_slam`.
 
 They decide when an external landmark track is considered stable enough to be augmented into the EKF state.
+
+The readiness rule is now type-aware:
+
+- `corner` tracks use the base thresholds
+- `endpoint` tracks use the endpoint-specific thresholds
+- `junction` tracks use the junction-specific thresholds
+
+This makes it possible to let sharper structural features enter the state earlier without relaxing augmentation for all landmark types.
 
 ## Practical Tuning Notes
 
