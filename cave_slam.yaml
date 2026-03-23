@@ -1,121 +1,139 @@
+# Top-level runtime settings for the simulation loop.
 simulation:
-  delay_ms: 50
-  frames: 500
-  random_seed: 50
+  delay_ms: 50  # Delay between rendered frames in milliseconds.
+  frames: 500  # Total number of simulation frames to run before stopping.
+  random_seed: 50  # Random seed used for reproducible environment generation and motion noise.
 
+# Environment generation or manual wall specification.
 environment:
+  # Parameters for the random cave/obstacle generator.
   generator:
-    enabled: true
-    complexity: 10      # Number of random obstacles to spawn
-    width: 15.0         # X boundary of the room
-    height: 15.0        # Y boundary of the room
-    overlap_boundaries: true # Allows random blocks to overlap wall to add feature complexity
-    min_area: 1.0     # Minimum polygon area in square units
-    max_area: 8.0     # Maximum polygon area in square units
-  # You can still provide manual walls here if generator.enabled is false
-  walls: []
+    enabled: true  # If true, build a random environment; if false, use the manual walls list below.
+    complexity: 10  # Number of random obstacles/polygons to generate.
+    width: 15.0  # Width of the generated environment in world units.
+    height: 15.0  # Height of the generated environment in world units.
+    overlap_boundaries: true  # Allow generated obstacles to overlap the outer boundary walls.
+    min_area: 1.0  # Minimum area for each generated polygon obstacle.
+    max_area: 8.0  # Maximum area for each generated polygon obstacle.
+  walls: []  # Manual wall list used only when generator.enabled is false.
 
+# Lidar sensor model and scan density.
 sensor:
-  fov_degrees: 30
-  num_rays: 8
-  max_range: 15.0
+  fov_degrees: 120  # Total lidar field of view in degrees.
+  num_rays: 32  # Number of rays cast across the field of view each frame.
+  max_range: 5.0  # Maximum sensing range of each lidar ray in world units.
+  # Range-dependent measurement noise applied to hit returns.
   noise:
-    enabled: true
-    min_relative_std: 0.005
-    max_relative_std: 0.05
+    enabled: true  # If true, perturb hit distances using the range-noise model.
+    min_relative_std: 0.005  # Relative standard deviation used for very short-range returns.
+    max_relative_std: 0.05  # Relative standard deviation used for max-range returns.
 
+# Geometric feature extraction from ordered lidar hit returns.
 feature_extraction:
-  enable_corners: true
-  enable_line_segments: true
-  enable_endpoints: true
-  enable_junctions: true
-  window_size: 2
-  line_min_points: 3
-  max_neighbor_gap: 1.0
-  min_segment_span: 0.2
-  max_line_residual: 0.12
-  min_corner_angle_deg: 45
-  max_corner_angle_deg: 135
-  nms_radius: 1
-  junction_merge_distance: 0.3
-  endpoint_merge_distance: 0.25
-  persistence_frames: 500
-  association_radius: 0.35
+  enable_corners: true  # Enable corner landmark detection from local left/right line fits.
+  enable_line_segments: true  # Enable line-segment landmark detection from contiguous scan chains.
+  enable_endpoints: true  # Enable endpoint landmark detection from fitted segment ends.
+  enable_junctions: true  # Enable junction landmark detection where fitted segments meet.
+  window_size: 2  # Number of neighboring points on each side used for corner fitting.
+  line_min_points: 3  # Minimum number of scan points required to form a candidate line segment.
+  max_neighbor_gap: 1.0  # Maximum distance between consecutive local scan points to keep them in one chain.
+  min_segment_span: 0.2  # Minimum end-to-end span required for a valid fitted segment.
+  max_line_residual: 0.12  # Maximum average point-to-line residual allowed for fitted line features.
+  min_corner_angle_deg: 45  # Minimum angle between adjacent fitted lines to accept a corner/junction.
+  max_corner_angle_deg: 135  # Maximum angle between adjacent fitted lines to accept a corner/junction.
+  nms_radius: 1  # Non-maximum-suppression radius, in scan indices, for nearby corner candidates.
+  junction_merge_distance: 0.3  # Maximum endpoint separation for two segments to be treated as a junction.
+  endpoint_merge_distance: 0.25  # Distance used to suppress duplicate endpoints and endpoint/junction overlap.
+  persistence_frames: 500  # Lifetime of display-only detected-landmark markers in frames.
+  association_radius: 0.35  # Base spatial radius used for track creation and nearby landmark association.
 
+# Agent motion and reactive obstacle-avoidance parameters.
 motion:
-  linear_speed: 0.2
-  random_turn_deg: 5
-  collision_turn_deg: 15
-  collision_distance: 1.0
+  linear_speed: 0.2  # Forward distance command applied on a normal movement step.
+  random_turn_deg: 5  # Small random heading change used during wandering behavior.
+  collision_turn_deg: 15  # Turn angle applied while actively avoiding an obstacle.
+  collision_distance: 1.0  # Forward clearance threshold below which avoidance is triggered.
 
+# Noise applied to odometry before EKF prediction.
 odometry_noise:
-  distance_std: 0.01
-  angle_std_deg: 0.025
+  distance_std: 0.01  # Standard deviation of translational odometry noise per step.
+  angle_std_deg: 0.025  # Standard deviation of rotational odometry noise per step in degrees.
 
+# Fused point-based voxel map parameters.
 voxel_grid:
-  voxel_size: 0.35
-  min_points_per_voxel: 3
-  point_size: 30
-  point_alpha: 0.9
-  color: darkorange
+  voxel_size: 0.35  # Spatial size of each voxel cell in the point-fusion map.
+  min_points_per_voxel: 3  # Minimum accumulated points required before a voxel is displayed.
+  point_size: 30  # Marker size used when rendering voxel points.
+  point_alpha: 0.9  # Marker transparency used when rendering voxel points.
+  color: darkorange  # Display color used for the voxel-grid overlay.
 
+# Log-odds occupancy grid parameters.
 occupancy_grid:
-  enabled: true
-  cell_size: 0.2
-  width: 17.0
-  height: 17.0
-  origin_x: -1.0
-  origin_y: -1.0
-  log_odds_hit: 0.85
-  log_odds_free: 0.4
-  log_odds_min: -4.0
-  log_odds_max: 4.0
-  occupied_threshold: 0.65
-  free_threshold: 0.35
-  ray_subsample: 1
+  enabled: true  # Enable occupancy-grid mapping and rendering support.
+  cell_size: 0.2  # Width and height of each occupancy-grid cell in world units.
+  width: 17.0  # Total width of the occupancy grid in world units.
+  height: 17.0  # Total height of the occupancy grid in world units.
+  origin_x: -1.0  # World-space x coordinate of the occupancy grid origin.
+  origin_y: -1.0  # World-space y coordinate of the occupancy grid origin.
+  log_odds_hit: 0.85  # Positive log-odds increment added to a hit endpoint cell.
+  log_odds_free: 0.4  # Negative log-odds carving magnitude applied to traversed free cells.
+  log_odds_min: -4.0  # Lower clamp for occupancy log-odds values.
+  log_odds_max: 4.0  # Upper clamp for occupancy log-odds values.
+  occupied_threshold: 0.65  # Probability threshold above which a cell is rendered as occupied.
+  free_threshold: 0.35  # Probability threshold below which a cell is rendered as free.
+  ray_subsample: 1  # Use every Nth ray when updating the occupancy grid.
 
+# Agent initial placement and startup behavior.
 agent:
+  # Initial true pose of the simulated robot.
   initial_pose:
-    x: 2.0
-    y: 2.0
-    theta_deg: 45
+    x: 2.0  # Initial x position of the robot in world coordinates.
+    y: 2.0  # Initial y position of the robot in world coordinates.
+    theta_deg: 45  # Initial robot heading in degrees.
+  # Optional scripted behavior before normal wandering begins.
   startup_behavior:
-    enabled: true
-    mode: spin_in_place
-    rotation_degrees: 360
-    turn_step_deg: 15
+    enabled: true  # If true, run the startup behavior before normal motion logic.
+    mode: spin_in_place  # Startup behavior mode; currently a turn-in-place scan.
+    rotation_degrees: 360  # Total rotation to complete during startup behavior.
+    turn_step_deg: 15  # Heading increment used on each startup spin step.
 
+# Plotting and overlay controls for the live visualization.
 plot:
-  figsize: [8, 8]
-  xlim: [-1, 16]
-  ylim: [-1, 16]
-  point_size: 10
-  point_alpha: 0.08
-  show_point_cloud: false   # Show or hide the raw accumulated point cloud
-  show_voxel_grid: false   # Show or hide the voxel-grid overlay
-  show_occupancy_grid: true   # Show or hide the occupancy-grid overlay
-  show_detected_landmarks: false   # Show or hide the red detected-landmark markers
-  show_ekf_overlay: false   # Show or hide the live EKF diagnostics text overlay
-  show_landmark_tracks: true   # Show or hide the landmark-track overlay
-  track_color_mode: type   # Track coloring: quality, age, augmented, or type
-  min_visible_track_observations: 2   # Hide weak provisional tracks until they have been seen at least this many times
-  min_visible_track_quality: 0.3   # Alternatively show a track early if its type-aware quality is already high enough
+  figsize: [8, 8]  # Figure size used for the Matplotlib window in inches.
+  xlim: [-1, 16]  # Visible x-axis limits for the plot.
+  ylim: [-1, 16]  # Visible y-axis limits for the plot.
+  point_size: 10  # Marker size used for the raw accumulated point cloud.
+  point_alpha: 0.08  # Marker transparency used for the raw accumulated point cloud.
+  show_point_cloud: false  # Show or hide the raw accumulated point-cloud overlay.
+  show_voxel_grid: false  # Show or hide the fused voxel-grid overlay.
+  show_occupancy_grid: true  # Show or hide the occupancy-grid overlay.
+  show_detected_landmarks: false  # Show or hide the red detected-landmark markers.
+  show_ekf_overlay: false  # Show or hide the live EKF diagnostics text box.
+  show_landmark_tracks: true  # Show or hide the landmark-track overlay.
+  track_color_mode: type  # Track coloring mode: quality, age, augmented, or type.
+  min_visible_track_observations: 2  # Minimum observations before a track becomes visible in the plot/count.
+  min_visible_track_quality: 0.3  # Alternative quality threshold allowing an otherwise-young track to become visible.
 
+# EKF localization / SLAM configuration.
 ekf:
-  mode: full_slam   # Use pose_only or full_slam to enable EKF state augmentation with landmarks
+  mode: full_slam  # EKF runtime mode: pose_only for localization or full_slam for state augmentation.
+  # Base range-bearing measurement model and type-specific trust scaling.
   measurement:
-    corner_noise_scale: 1.0   # Baseline EKF measurement noise scale for generic corner landmarks
-    endpoint_noise_scale: 0.85   # Lower values make endpoint updates slightly more trusted than corners
-    junction_noise_scale: 0.75   # Lower values make junction updates slightly more trusted than corners
+    corner_noise_scale: 1.0  # Noise scale applied to corner observations in EKF association and updates.
+    endpoint_noise_scale: 0.85  # Noise scale applied to endpoint observations; lower trusts them more than corners.
+    junction_noise_scale: 0.75  # Noise scale applied to junction observations; lower trusts them more than corners.
+  # EKF update-stage controls.
   pose_update:
-    nis_threshold: 50.0   # Reject EKF correction updates whose normalized innovation is too large
+    nis_threshold: 50.0  # Reject matched EKF updates whose normalized innovation squared exceeds this threshold.
+  # Landmark-track association controls.
   association:
-    line_orientation_threshold_deg: 20.0   # Maximum orientation mismatch allowed for line-segment track matching
-    line_extent_ratio_threshold: 0.6   # Maximum normalized length mismatch allowed for line-segment track matching
+    line_orientation_threshold_deg: 20.0  # Maximum allowed orientation mismatch for line-segment track matching.
+    line_extent_ratio_threshold: 0.6  # Maximum normalized length mismatch for line-segment track matching.
+  # Rules controlling when external tracks may be augmented into the full SLAM state.
   augmentation:
-    min_observations: 3   # Do not augment a landmark into full_slam state until it has been seen enough times
-    min_track_quality: 0.6   # Alternatively allow augmentation once the track quality is high enough
-    endpoint_min_observations: 2   # Endpoint tracks can enter the EKF sooner because they are usually sharper than corners
-    endpoint_min_track_quality: 0.5   # Endpoint quality threshold for early augmentation
-    junction_min_observations: 2   # Junction tracks can also enter the EKF sooner when consistently observed
-    junction_min_track_quality: 0.45   # Junction quality threshold for early augmentation
+    min_observations: 3  # Base observation-count threshold before a generic track may enter the EKF state.
+    min_track_quality: 0.6  # Base quality threshold that can also allow a generic track into the EKF state.
+    endpoint_min_observations: 2  # Endpoint-specific observation threshold for earlier state augmentation.
+    endpoint_min_track_quality: 0.5  # Endpoint-specific quality threshold for earlier state augmentation.
+    junction_min_observations: 2  # Junction-specific observation threshold for earlier state augmentation.
+    junction_min_track_quality: 0.45  # Junction-specific quality threshold for earlier state augmentation.
